@@ -1,0 +1,11 @@
+# 凭据文件（绝不入库）
+*creds*.yaml
+jira-api-creds.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
