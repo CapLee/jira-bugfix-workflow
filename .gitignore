@@ -10,3 +10,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .hermes-tmp*/
+
+# 附件下载默认目录
+jira-attachments/

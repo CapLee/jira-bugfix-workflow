@@ -1,0 +1,36 @@
+# 更新日志
+
+## v2.0.0（2025-09）
+
+**更通用：换项目 / 换实例 / 多账号**
+
+- 新增凭据 **profile** 机制：`--profile 名字` 读取 profiles 目录下 `名字.yaml`（`JIRA_PROFILE` / `JIRA_PROFILES_DIR` 环境变量同样支持），多实例并存互不干扰
+- 认证支持 **Bearer token**（Server PAT）；Cloud「邮箱+API Token」走 Basic 即可
+- 凭据文件新增可选键：`token` / `insecure` / `timeout`
+- 新增 `whoami`（身份+实例冒烟）、`projects`（列项目）、`fields`（查字段 id/类型）——接入新环境先跑这三个
+- `search --url`：直接贴 JIRA 过滤器链接（自动提取 JQL），browse 链接会给出明确提示
+- `search` 超 100 条自动分页；新增 `--all` 取全量；表格新增「经办人」列
+- 429/5xx/网络抖动自动重试（最多 2 次，尊重 Retry-After）；内网自签证书自动降级为不校验重试
+
+**更丰富：改别人的单 / 协作 / 安全预演**
+
+- 新增 `assign`：改经办人（`--to me` 一行接管别人名下的单），执行后读回验证
+- 新增 `comment`：加评论（`--body` / `--body-file`），支持 JIRA wiki 语法（`[~登录名]` @人）
+- 新增 `attachments`：下载单子附件（截图等）
+- 全部写操作（start/resolve/assign/comment）支持 **`--dry-run` 预演**：打印将发送的完整请求与流转屏幕字段清单，零写请求
+- `resolve` 增强：执行后**逐字段读回校验**（不只状态）；支持 `--comment` 流转附评论；无可用流转时给出「先 assign --to me 接管」提示
+- `issue` 输出新增附件清单；支持 `--format json`
+
+**修复**
+
+- 选项值校验提前到必填检查之前（错误提示更贴近真实问题）
+- 沿用：写操作后读回验证、词表预校验中止、零第三方依赖
+
+**工程**
+
+- 新增 `scripts/selftest_offline.py`：离线 mock 自测（26 项断言，零真实请求，改完脚本跑一遍）
+
+## v1.0.0
+
+- 首个版本：`search` / `issue` / `transitions` / `editmeta` / `start` / `resolve`
+- JIRA Server 8.x REST + Basic 认证；动态发现流转 id/字段 id/词表；写操作读回验证
