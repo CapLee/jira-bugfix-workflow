@@ -48,6 +48,7 @@
 | `未设置活动项目` | `python3 jira.py use <项目>` 设置；或 --jql/--url/--project 显式指定 |
 | `该查询未限定项目…被拦截` | 护栏：手写 JQL/链接没带 project；补 `project = X`，或用户确认跨项目后加 `--all-projects` |
 | `查询未指向当前活动项目`（提示） | 检查 JQL 是否写错项目；临时看别的项目先 `use` 切换（确要跨项目加 `--all-projects`） |
+| 在项目目录里裸跑 search 自动换了项目 | 这是**项目文件夹配置**（`.jira-project.yaml`）在就近生效——正常；`pconfig --here` 查看/修改，离开目录恢复活动项目 |
 | `当前状态「X」已不是「未开始」` | start 安全护栏：单已处理中/终态；确要流转用 `--transition-id` |
 | 项目名记不住 / 想换项目 | `use` 看已登记清单（序号/前缀切换）；`projects --query` 全量搜 |
 | `HTTP 400 … “resolution”域中没有…` | 你手写 JQL 里用了本项目没有的 resolution 词（如 Fixed）→ 用 `resolution is not EMPTY` 或 `statusCategory = done` |

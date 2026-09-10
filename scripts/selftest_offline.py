@@ -6,7 +6,8 @@
 用法:  python3 scripts/selftest_offline.py     （退出码 0 = 全过）
 覆盖: 认证(Basic/Bearer)、profile、init 初始化向导、use 活动项目切换、
       --url 解析、自动分页、429/5xx 重试、dry-run 零写入、resolve 读回校验、
-      assign/comment/attachments、纯数字单号、跨项目提示、各类错误路径。
+      assign/comment/attachments、纯数字单号、跨项目提示、各类错误路径、
+      项目文件夹配置（就近发现、优先级、pconfig --here）。
       改完 jira.py 跑一遍。
 """
 import base64
@@ -191,13 +192,14 @@ def ctl(**kw):
     urllib.request.urlopen(f"{BASE}/__ctl/set?{q}").read()
 
 
-def run(argv, env_extra=None):
+def run(argv, env_extra=None, cwd=None):
     env = dict(os.environ)
     env["JIRA_PROJECT_CONFIGS_DIR"] = PROJCFG   # 隔离：不受用户真实项目配置影响
+    env["JIRA_NO_FOLDER_CFG"] = "1"             # 默认禁用「项目文件夹配置」（专项用例再打开）
     if env_extra:
         env.update(env_extra)
     return subprocess.run([sys.executable, SCRIPT, *argv], capture_output=True,
-                          text=True, encoding="utf-8", env=env, cwd=BASE_TMP,
+                          text=True, encoding="utf-8", env=env, cwd=cwd or BASE_TMP,
                           stdin=subprocess.DEVNULL)
 
 
@@ -232,7 +234,7 @@ with open(os.path.join(profdir, "token-inst.yaml"), "w", encoding="utf-8") as fp
     fp.write(f"base_url: {BASE}\ntoken: SECRET123\ntimeout: 30\ninsecure: true\n")
 
 r = run(["--version"])
-check("01 version", r.returncode == 0 and "2.2.0" in r.stdout, r.stdout + r.stderr)
+check("01 version", r.returncode == 0 and "2.3.0" in r.stdout, r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "whoami"])
 last_auth = state["requests"][-1][2]
@@ -503,6 +505,84 @@ check("45 builtin fallback", r.returncode == 0 and "模板: 内置默认" in r.s
 r = run(["--config", newcfg, "pconfig", "STRUCTURING", "--clear"])
 check("46 pconfig clear", r.returncode == 0 and "已删除项目配置" in r.stdout and not os.path.exists(pj),
       r.stdout + r.stderr)
+
+# ---------- v2.3: 项目文件夹配置（就近发现 / pconfig --here） ----------
+
+NB_DIR = os.path.join(BASE_TMP, "proj-folder")
+NB_SUB = os.path.join(NB_DIR, "src", "deep")
+os.makedirs(NB_SUB, exist_ok=True)
+tpl_nb = "project = {project} AND status = Working order by updated DESC"
+with open(os.path.join(NB_DIR, ".jira-project.yaml"), "w", encoding="utf-8") as fp:
+    fp.write(f"project: T\ndefault_jql: {tpl_nb}\n")
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"], {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_DIR)
+jql = last_search_jql()
+check("47 folder cfg used (project+template)",
+      r.returncode == 0 and "[项目] 项目文件夹: T" in r.stdout and "模板: 项目文件夹" in r.stdout
+      and jql == "project = T AND status = Working order by updated DESC"
+      and "工作目录启用了项目文件夹配置" in r.stderr,
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"], {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_SUB)
+jql = last_search_jql()
+check("48 folder cfg walked up from subdir",
+      r.returncode == 0 and "[项目] 项目文件夹: T" in r.stdout
+      and jql == "project = T AND status = Working order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--project", "STRUCTURING", "--max", "2"],
+        {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_DIR)
+jql = last_search_jql()
+check("49 folder cfg skipped on project mismatch",
+      r.returncode == 0 and "[项目] 指定项目: STRUCTURING" in r.stdout
+      and jql == "project = STRUCTURING AND status != 未开始 AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+NB_EMPTY = os.path.join(BASE_TMP, "proj-empty")
+os.makedirs(NB_EMPTY, exist_ok=True)
+r = run(["--config", newcfg, "pconfig", "--here", "--set-project", "T", "--default-jql", tpl_nb],
+        {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_EMPTY)
+nbf = os.path.join(NB_EMPTY, ".jira-project.yaml")
+check("50 pconfig --here write",
+      r.returncode == 0 and os.path.exists(nbf) and "project: T" in read_cfg(nbf) and tpl_nb in read_cfg(nbf),
+      f"rc={r.returncode}\n{r.stdout}{r.stderr}")
+r = run(["--config", newcfg, "pconfig", "--here"], {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_EMPTY)
+check("51 pconfig --here view",
+      r.returncode == 0 and "项目文件夹配置（就近）" in r.stdout and "project: T" in r.stdout,
+      r.stdout + r.stderr)
+r = run(["--config", newcfg, "pconfig", "--here", "--clear"], {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_EMPTY)
+check("52 pconfig --here clear", r.returncode == 0 and not os.path.exists(nbf), r.stdout + r.stderr)
+
+NB_ELSE = os.path.join(BASE_TMP, "proj-else")
+os.makedirs(NB_ELSE, exist_ok=True)
+elsef = os.path.join(NB_ELSE, "custom-nb.yaml")
+with open(elsef, "w", encoding="utf-8") as fp:
+    fp.write("project: STRUCTURING\ndefault_jql: project = {project} AND priority = High order by updated DESC\n")
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"],
+        {"JIRA_NO_FOLDER_CFG": "", "JIRA_PROJECT_CONFIG_PATH": elsef}, cwd=NB_EMPTY)
+jql = last_search_jql()
+check("53 JIRA_PROJECT_CONFIG_PATH override",
+      r.returncode == 0 and jql == "project = STRUCTURING AND priority = High order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"], cwd=NB_DIR)   # run() 默认带 JIRA_NO_FOLDER_CFG=1
+jql = last_search_jql()
+check("54 NO_FOLDER_CFG disables",
+      r.returncode == 0 and "[项目] 活动项目: BPM" in r.stdout
+      and jql == "project = BPM AND status != 未开始 AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+state["requests"].clear()
+r = run(["--config", newcfg, "issue", "1"], {"JIRA_NO_FOLDER_CFG": ""}, cwd=NB_DIR)
+paths = [x[1] for x in state["requests"]]
+check("55 bare number uses folder project",
+      r.returncode == 0 and any("/rest/api/2/issue/T-1" in p for p in paths),
+      f"rc={r.returncode} paths={paths}\n{r.stdout}{r.stderr}")
 
 failed = [n for n, ok in results if not ok]
 print(f"\n===== {len(results) - len(failed)}/{len(results)} PASS =====")

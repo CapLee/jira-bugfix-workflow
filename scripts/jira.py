@@ -16,10 +16,11 @@
         transitions / editmeta / start / resolve / assign / comment / whoami /
         projects / fields / attachments
 写操作（start/resolve/assign/comment）均支持 --dry-run 预演，执行后自动读回验证。
-不带 --jql/--url/--project 的 search 默认聚焦「当前活动项目」（use 切换）；
+不带 --jql/--url/--project 的 search 默认聚焦当前上下文项目：
+     项目文件夹配置（就近 .jira-project.yaml，pconfig --here 管理）> 活动项目（use 切换）。
 未限定 project 的 --jql/--url 查询默认被拦截（确要跨项目需显式 --all-projects）。
-拉单模板优先级：项目配置（hermes/jira-project-configs/<KEY>.yaml）> 全局配置（default_jql）> 内置默认。
-纯数字单号（如 issue 25）自动补活动项目前缀。
+拉单模板优先级：项目文件夹配置 > 项目配置（hermes/jira-project-configs/<KEY>.yaml）>
+     全局配置（default_jql）> 内置默认。纯数字单号（如 issue 25）自动补上下文项目前缀。
 每个子命令 --help 有详细用法。错误退出码 1，正常 0。
 """
 import argparse
@@ -36,7 +37,7 @@ import urllib.request
 from urllib.parse import urlencode, urlparse, parse_qs
 
 PROG = os.path.basename(sys.argv[0])
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # 运行期配置（main 里填充）：base / user / pw / token / insecure / timeout /
 #   projects / active / default_jql / path
@@ -317,23 +318,28 @@ def _fmt_fields_csv(fields):
 # ---------------- 项目上下文（活动项目） ----------------
 
 def _key_arg(raw):
-    """单号参数：纯数字时自动补当前活动项目前缀（如 25 → STRUCTURING-25）。"""
+    """单号参数：纯数字时自动补上下文项目前缀（项目文件夹配置 > 活动项目，如 25 → STRUCTURING-25）。"""
     k = str(raw or "").strip()
     if re.fullmatch(r"\d+", k):
-        act = (C.get("active") or "").strip()
-        if act:
-            return f"{act}-{k}"
-        die(f"「{k}」是纯数字：先设置活动项目（{PROG} use <项目>），或给完整单号（如 STRUCTURING-{k}）")
+        ctx, _ = _ctx_project()
+        if ctx:
+            return f"{ctx}-{k}"
+        die(f"「{k}」是纯数字：先设置活动项目（{PROG} use <项目>）、或在项目文件夹放置配置，"
+            f"或给完整单号（如 STRUCTURING-{k}）")
     return k
 
 
 def _warn_project(key):
-    """操作的单不属于当前活动项目时给出提醒（不拦截）。"""
-    act = (C.get("active") or "").strip()
+    """操作的单不属于当前上下文项目（项目文件夹配置 > 活动项目）时给出提醒（不拦截）。"""
+    ctx, is_folder = _ctx_project()
     proj = key.split("-", 1)[0] if "-" in key else ""
-    if act and proj and proj.upper() != act.upper():
-        print(f"[提示] {key} 属于项目 {proj}，当前活动项目是 {act}"
-              f"（如需切换: {PROG} use {proj}）", file=sys.stderr)
+    if ctx and proj and proj.upper() != ctx.upper():
+        if is_folder:
+            print(f"[提示] {key} 属于项目 {proj}，当前目录默认是项目 {ctx}"
+                  f"（{os.path.basename(_nearby_cfg()['_path'])} 声明；操作其它项目的单请确认无误）", file=sys.stderr)
+        else:
+            print(f"[提示] {key} 属于项目 {proj}，当前活动项目是 {ctx}"
+                  f"（如需切换: {PROG} use {proj}）", file=sys.stderr)
 
 
 def _project_cfg_dir():
@@ -365,6 +371,61 @@ def _load_project_cfg(project):
         return {}, p
 
 
+# ---------------- 项目文件夹配置（就近发现，v2.3） ----------------
+
+_NEARBY_NAMES = (".jira-project.yaml", ".jira-project.yml", "jira-project.yaml", "jira-project.yml")
+_nearby = None
+
+
+def _nearby_cfg_path():
+    """从当前工作目录向上查找项目文件夹配置；JIRA_PROJECT_CONFIG_PATH 可显式指定，JIRA_NO_FOLDER_CFG=1 可禁用。"""
+    env = os.environ.get("JIRA_PROJECT_CONFIG_PATH")
+    if env:
+        if os.path.isfile(env):
+            return env
+        print(f"[警告] JIRA_PROJECT_CONFIG_PATH 指向的文件不存在: {env}", file=sys.stderr)
+        return None
+    if os.environ.get("JIRA_NO_FOLDER_CFG"):
+        return None
+    d = os.path.abspath(os.getcwd())
+    while True:
+        for name in _NEARBY_NAMES:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _nearby_cfg():
+    """读取项目文件夹配置（进程内缓存；返回 dict，含 _path/_dir；未找到返回空 dict）。"""
+    global _nearby
+    if _nearby is None:
+        p = _nearby_cfg_path()
+        cfg = {}
+        if p:
+            try:
+                cfg = _read_flat(p)
+            except OSError as e:
+                print(f"[警告] 项目文件夹配置读取失败: {p}（{e}）", file=sys.stderr)
+                cfg = {}
+            cfg["_path"] = p
+            cfg["_dir"] = os.path.dirname(p)
+            cfg["project"] = (cfg.get("project") or "").strip().upper()
+        _nearby = cfg
+    return _nearby
+
+
+def _ctx_project():
+    """当前上下文项目（项目文件夹配置 > 活动项目），返回 (project, is_folder)。"""
+    nb = _nearby_cfg()
+    if nb.get("project"):
+        return nb["project"], True
+    return (C.get("active") or "").strip(), False
+
+
 # ---------------- search ----------------
 
 DEFAULT_JQL = "project = {project} AND resolution = Unresolved AND assignee in (currentUser()) order by updated DESC"
@@ -382,17 +443,24 @@ def _jql_from_url(u):
 
 
 def _build_default_jql(project):
-    """生成默认 JQL，返回 (jql, 模板来源)。模板优先级：项目配置 > 全局配置(default_jql) > 内置默认。"""
-    pcfg, ppath = ({}, None)
-    if project not in ("ALL", "*", "全部"):
-        pcfg, ppath = _load_project_cfg(project)
-    if pcfg.get("default_jql"):
-        tpl, src = pcfg["default_jql"], f"项目配置 {os.path.basename(ppath)}"
-    elif C.get("default_jql"):
-        tpl, src = C["default_jql"], "全局配置"
+    """生成默认 JQL，返回 (jql, 模板来源)。模板优先级：项目文件夹 > 项目配置 > 全局配置 > 内置默认。"""
+    all_set = project in ("ALL", "*", "全部")
+    nb = _nearby_cfg()
+    nb_proj = (nb.get("project") or "").upper()
+    use_nb = bool(nb.get("default_jql")) and (not nb_proj or (not all_set and nb_proj == str(project).upper()))
+    if use_nb:
+        tpl, src = nb["default_jql"], f"项目文件夹 {nb['_path']}"
     else:
-        tpl, src = DEFAULT_JQL, "内置默认"
-    if project in ("ALL", "*", "全部"):
+        pcfg, ppath = ({}, None)
+        if not all_set:
+            pcfg, ppath = _load_project_cfg(project)
+        if pcfg.get("default_jql"):
+            tpl, src = pcfg["default_jql"], f"项目配置 {os.path.basename(ppath)}"
+        elif C.get("default_jql"):
+            tpl, src = C["default_jql"], "全局配置"
+        else:
+            tpl, src = DEFAULT_JQL, "内置默认"
+    if all_set:
         if "{project}" not in tpl:
             return tpl, src
         s = re.sub(r"project\s*=\s*\{project\}\s*AND\s+", "", tpl, count=1, flags=re.I)
@@ -433,28 +501,45 @@ def cmd_search(args):
     elif args.jql:
         jql = args.jql
     else:
-        proj = (args.project or C.get("active") or "").strip()
+        nb = _nearby_cfg()
+        nb_proj = (nb.get("project") or "").strip().upper()
+        proj = (args.project or nb_proj or C.get("active") or "").strip()
         if proj and proj.upper() not in ("ALL", "*", "全部"):
             proj = proj.upper()
         if not proj:
             die(f"未给查询条件且未设置活动项目：先用 {PROG} use <项目> 设置（或 --jql/--url/--project 显式指定；"
-                f"--project ALL=不限项目）")
+                f"--project ALL=不限项目；也可在项目文件夹放 .jira-project.yaml，见 {PROG} pconfig --here）")
         jql, tpl_src = _build_default_jql(proj)
         label = "全部" if proj in ("ALL", "*", "全部") else proj
-        src = "指定项目" if args.project else "活动项目"
+        if args.project:
+            src = "指定项目"
+        elif nb_proj and nb_proj == proj:
+            src = "项目文件夹"
+        else:
+            src = "活动项目"
         note = f"[项目] {src}: {label}（模板: {tpl_src}）；JQL: {jql}"
         print(note, file=(sys.stderr if args.format == "json" else sys.stdout))
+        act0 = (C.get("active") or "").strip().upper()
+        if src == "项目文件夹" and act0 and act0 != proj:
+            print(f"[提示] 工作目录启用了项目文件夹配置（{nb['_path']}）→ 默认查 {proj}；"
+                  f"活动项目是 {C.get('active')}（离开该目录后恢复）", file=sys.stderr)
     if explicit:
         # 防手滑/防 AI 跑偏：未限定项目的查询默认拦截；指向别的项目时给提示
-        act = (C.get("active") or "").strip()
-        if act and act.upper() not in ("ALL", "*", "全部") and not args.all_projects:
+        ctx, is_folder = _ctx_project()
+        if ctx and ctx.upper() not in ("ALL", "*", "全部") and not args.all_projects:
+            desc = (f"当前目录所属项目是 {ctx}（项目文件夹配置声明）" if is_folder
+                    else f"当前活动项目是 {ctx}")
             if not re.search(r"project\s*(?:=|!=|\bin\b)", jql, flags=re.I):
-                die(f"该查询未限定项目，会跨【全部项目】拉单。当前活动项目是 {act}：\n"
-                    f"  · 只查当前项目：直接运行不带条件的 search，或把 project = {act} 写进 JQL\n"
+                die(f"该查询未限定项目，会跨【全部项目】拉单。{desc}：\n"
+                    f"  · 只查当前项目：直接运行不带条件的 search，或把 project = {ctx} 写进 JQL\n"
                     f"  · 确实要跨项目搜索：显式加 --all-projects")
-            if act.upper() not in jql.upper():
-                print(f"[提示] 查询未指向当前活动项目 {act}——若只是想查其它项目，先 {PROG} use <项目> 切换；"
-                      f"确认为跨项目搜索请加 --all-projects（可消除本提示）", file=sys.stderr)
+            if ctx.upper() not in jql.upper():
+                if is_folder:
+                    print(f"[提示] 查询未指向当前目录所属项目 {ctx}（.jira-project.yaml 声明）——"
+                          f"若只是查其它项目可用 --all-projects 消除本提示", file=sys.stderr)
+                else:
+                    print(f"[提示] 查询未指向当前活动项目 {ctx}——若只是想查其它项目，先 {PROG} use <项目> 切换；"
+                          f"确认为跨项目搜索请加 --all-projects（可消除本提示）", file=sys.stderr)
     issues, total = _fetch_issues(jql, _fmt_fields_csv(args.fields), args.max, args.all)
     rows = []
     for it in issues:
@@ -744,6 +829,10 @@ def cmd_whoami(args):
         print(f"当前活动项目: {act}（已登记 {n} 个项目；{PROG} use 切换）")
     else:
         print(f"当前活动项目: （未设置）→ {PROG} use <项目>（已登记 {n} 个）")
+    nb = _nearby_cfg()
+    if nb.get("_path"):
+        nbtail = f"（project={nb['project']}）" if nb.get("project") else ""
+        print(f"项目文件夹配置: {nb['_path']}{nbtail}")
 
 
 # ---------------- 初始化 / 项目切换 ----------------
@@ -790,6 +879,10 @@ def _init_check(path):
     pf = sorted(f for f in os.listdir(pd) if f.lower().endswith((".yaml", ".yml"))) if os.path.isdir(pd) else []
     if pf:
         print(f"  项目级拉单模板: {', '.join(pf)}（目录: {pd}）")
+    nb = _nearby_cfg()
+    if nb.get("_path"):
+        nbtail = f"（project={nb['project']}）" if nb.get("project") else ""
+        print(f"  项目文件夹配置: {nb['_path']}{nbtail}")
     print("  状态: 已初始化 ✓")
 
 
@@ -972,9 +1065,52 @@ def cmd_use(args):
     tail = f"（新登记，共 {len(C['projects'])} 个）" if is_new else ""
     print(f"已切换当前活动项目: {key} {tail}".rstrip())
     print("之后不带 --jql/--url/--project 的 search 默认只查它；其他项目的单会给出提示（--project KEY 可临时换）。")
+    print("（注：若所在目录启用了项目文件夹配置 .jira-project.yaml，搜索默认以它为准）")
 
 
 def cmd_pconfig(args):
+    nb = _nearby_cfg()
+    if getattr(args, "here", False):
+        if args.project:
+            die("pconfig <KEY> 管理的是 hermes 项目配置；--here 管理当前目录的 .jira-project.yaml，两者不要同时用")
+        cwd_file = os.path.join(os.getcwd(), ".jira-project.yaml")
+        if args.clear:
+            if os.path.exists(cwd_file):
+                os.remove(cwd_file)
+                print(f"已删除项目文件夹配置: {cwd_file}")
+            else:
+                print(f"（当前目录没有 .jira-project.yaml，无需删除）: {cwd_file}")
+            return
+        ups = {}
+        if getattr(args, "set_project", None):
+            ups["project"] = args.set_project.strip().upper()
+        if args.set_default_jql is not None:
+            if "{project}" not in args.set_default_jql:
+                die("模板里必须包含 {project} 占位符（例如: project = {project} AND status = \"Initial\" order by updated DESC）")
+            ups["default_jql"] = args.set_default_jql
+        if ups:
+            if not os.path.exists(cwd_file):
+                with open(cwd_file, "w", encoding="utf-8") as fp:
+                    fp.write("# JIRA 项目文件夹配置（工具会从当前目录向上查找本文件；放在项目根目录即可）\n"
+                             "# 优先级: 项目文件夹配置 > hermes 项目配置(<KEY>.yaml) > 全局配置(default_jql) > 内置默认\n"
+                             "# 键: project=JIRA项目KEY / default_jql=拉单模板(含{project}) / profile=多实例名(可选)\n")
+            _update_cfg(cwd_file, ups)
+            print(f"已写入项目文件夹配置: {cwd_file}")
+            for k, v in ups.items():
+                print(f"  {k}: {v}")
+            anc = nb.get("_path")
+            if anc and os.path.abspath(anc) != os.path.abspath(cwd_file):
+                print(f"[提示] 上层目录已有配置文件 {anc}；本文件更靠近当前目录，优先生效")
+            return
+        if nb.get("_path"):
+            print(f"项目文件夹配置（就近）: {nb['_path']}")
+            with open(nb["_path"], encoding="utf-8") as fp:
+                print(fp.read().strip())
+        else:
+            print("当前目录及上层未发现 .jira-project.yaml —— 创建示例:")
+            print(f"  {PROG} pconfig --here --set-project STRUCTURING "
+                  f"--default-jql 'project = {{project}} AND resolution = Unresolved order by updated DESC'")
+        return
     proj = (args.project or C.get("active") or "").strip().upper()
     d = _project_cfg_dir()
     if args.set_default_jql is not None or args.clear:
@@ -993,7 +1129,7 @@ def cmd_pconfig(args):
         _update_cfg(p, {"default_jql": args.set_default_jql})
         print(f"已写入项目配置: {p}")
         print(f"  default_jql: {args.set_default_jql}")
-        print(f"（{proj} 的拉单将优先用该模板；优先级：项目配置 > 全局配置 > 内置默认）")
+        print(f"（{proj} 的拉单将优先用该模板；优先级：项目文件夹 > 项目配置 > 全局配置 > 内置默认）")
         return
     if args.project:
         p = _project_cfg_path(proj)
@@ -1002,9 +1138,16 @@ def cmd_pconfig(args):
             with open(p, encoding="utf-8") as fp:
                 print(fp.read().strip())
         g = C.get("default_jql")
-        print(f"生效顺序: 项目配置（{'有' if p else '无'}）> 全局配置（{'有 default_jql' if g else '无'}）> 内置默认")
+        nbp = nb.get("_path")
+        print(f"生效顺序: 项目文件夹（{'有: ' + nbp if nbp else '无'}）> 项目配置（{'有' if p else '无'}）"
+              f"> 全局配置（{'有 default_jql' if g else '无'}）> 内置默认")
         print(f"内置默认: {DEFAULT_JQL}")
         return
+    if nb.get("_path"):
+        nbtail = f"（project={nb['project']}）" if nb.get("project") else ""
+        print(f"项目文件夹配置（就近生效）: {nb['_path']}{nbtail}")
+    else:
+        print(f"项目文件夹配置: （当前目录及上层未启用；在项目根目录放 .jira-project.yaml 即可，见 {PROG} pconfig --here）")
     print(f"项目配置目录: {d}")
     files = sorted(f for f in os.listdir(d)
                    if f.lower().endswith((".yaml", ".yml"))) if os.path.isdir(d) else []
@@ -1268,11 +1411,14 @@ def main():
     us.add_argument("target", nargs="?", help="项目 KEY（或列表里的序号；支持前缀模糊匹配）")
     us.set_defaults(fn=cmd_use)
 
-    pc = sub.add_parser("pconfig", help="项目级配置（拉单模板）：查看/设置；优先级 项目配置>全局配置>内置默认")
+    pc = sub.add_parser("pconfig", help="项目配置（拉单模板）：hermes <KEY>.yaml 或 --here 管当前目录 .jira-project.yaml；优先级 项目文件夹>项目配置>全局>内置")
     pc.add_argument("project", nargs="?", help="项目 KEY（省略=列目录；配合 --default-jql/--clear 时默认用当前活动项目）")
+    pc.add_argument("--here", action="store_true",
+                    help="管理当前目录的项目文件夹配置 .jira-project.yaml（不带其它参数=查看）")
+    pc.add_argument("--set-project", dest="set_project", metavar="KEY", help="（配合 --here）写入 project: KEY")
     pc.add_argument("--default-jql", dest="set_default_jql", metavar="JQL",
-                    help="写入该项目默认拉单模板（必须含 {project} 占位符）")
-    pc.add_argument("--clear", action="store_true", help="删除该项目的配置文件")
+                    help="写入默认拉单模板（必须含 {project} 占位符；--here 时写入文件夹配置）")
+    pc.add_argument("--clear", action="store_true", help="删除配置文件（--here 时删当前目录的 .jira-project.yaml）")
     pc.set_defaults(fn=cmd_pconfig)
 
     s = sub.add_parser("search", help="JQL 搜索 bug 清单（超 100 自动分页；不传条件=当前活动项目我的未解决）")
@@ -1358,6 +1504,10 @@ def main():
         # init 自行处理配置的加载/创建（首次运行时文件还不存在）
         args.fn(args)
         return
+    nb = _nearby_cfg()
+    if (not args.config) and (not args.profile) and (not os.environ.get("JIRA_PROFILE")) and nb.get("profile"):
+        args.profile = nb["profile"]
+        print(f"[提示] 使用项目文件夹配置的 profile: {nb['profile']}（{nb['_path']}）", file=sys.stderr)
     path = resolve_creds_path(args)
     C = load_creds(path)
     if args.timeout:

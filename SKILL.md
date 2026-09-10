@@ -20,6 +20,7 @@ version: 2.2.0
 - `python3 scripts/jira.py init --check` → 自查（返回码 0=已就绪）；未就绪跑 `init` 向导（账号 → 现场验证 → 勾选登记项目 → 设活动项目）
 - 凭据文件（flat yaml：base_url / username / password，可选 token / insecure / timeout / projects / active_project / default_jql），默认 `%LOCALAPPDATA%\hermes\jira-api-creds.yaml`（macOS/Linux `~/hermes/…`）；多实例：`hermes/jira-profiles/<名字>.yaml` + `--profile <名字>`
 - **活动项目**：`use` 查看/切换；不带条件的 search、纯数字单号都聚焦当前活动项目
+- **项目文件夹配置（v2.3）**：在项目根目录放 `.jira-project.yaml`（`pconfig --here --set-project <KEY> --default-jql '…'` 写入）→ 在该目录（含子目录）裸跑 search / 纯数字单号都以它为准；优先级 **项目文件夹 > hermes 项目配置 <KEY>.yaml > 全局配置 > 内置默认**（显式 --jql/--url/--project 永远最高）
 - 冒烟：`python3 scripts/jira.py whoami`（身份+实例+活动项目一行看清）
 
 ## 命令速查（全部 `--help` 可用）
@@ -27,7 +28,8 @@ version: 2.2.0
 ```
 init [--check]                           # 初始化向导 / 体检（首次必跑）
 use [KEY]                                # 查看/切换当前活动项目
-pconfig [KEY] [--default-jql '…']        # 项目级拉单模板（项目配置>全局配置>内置默认）
+pconfig [KEY] [--default-jql '…']        # hermes 项目配置（<KEY>.yaml）
+pconfig --here [--set-project KEY] [--default-jql '…']  # 项目文件夹配置（.jira-project.yaml，就近生效）
 whoami                                   # 身份/实例/活动项目（冒烟首选）
 search                                   # 不传条件 = 当前活动项目我的未解决
 search --jql '…' [--max|--all] [--format table|json|md]   # 拉清单，自动分页

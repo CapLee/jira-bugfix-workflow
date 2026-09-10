@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.3.0（2025-09）
+
+**项目文件夹配置（跟着项目走的拉单模板）**
+
+- 新增**项目文件夹配置**：在项目根目录放 `.jira-project.yaml`（从当前目录向上查找），声明 `project`（默认项目）/ `default_jql`（拉单模板）/ `profile`（可选）——在该目录（含子目录）干活时，裸跑 `search`、纯数字单号（`issue 25`）自动以它为准；离开目录恢复活动项目
+- 优先级链升级：**项目文件夹 > 项目配置（hermes `<KEY>.yaml`）> 全局配置（default_jql）> 内置默认**（显式 `--jql/--url/--project` 永远最高）
+- 新增 `pconfig --here`：查看/写入/删除当前目录的 `.jira-project.yaml`（`--set-project` / `--default-jql` / `--clear`）
+- `whoami` / `init --check` / `pconfig` 输出均标注当前项目文件夹配置；搜索 `[项目]` 行来源新增「项目文件夹」
+- `JIRA_PROJECT_CONFIG_PATH` 可指定任意配置文件；`JIRA_NO_FOLDER_CFG=1` 临时禁用就近查找
+- 自测扩到 66 项离线断言（含就近发现/子目录向上/优先级/--here 读写删/环境变量开关）
+
 ## v2.2.0（2025-09）
 
 **防跨项目跑偏 + 项目级拉单模板**
