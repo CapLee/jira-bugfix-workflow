@@ -21,6 +21,8 @@ from urllib.parse import urlparse, parse_qs, quote_plus
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jira.py")
 BASE_TMP = tempfile.mkdtemp(prefix="jira-selftest-")
+PROJCFG = os.path.join(BASE_TMP, "proj-cfg")
+os.makedirs(PROJCFG, exist_ok=True)
 
 PORT = 0
 state = {"requests": [], "fail_search": 0, "assignee": {"name": "tester", "displayName": "测试员甲"},
@@ -187,6 +189,7 @@ def ctl(**kw):
 
 def run(argv, env_extra=None):
     env = dict(os.environ)
+    env["JIRA_PROJECT_CONFIGS_DIR"] = PROJCFG   # 隔离：不受用户真实项目配置影响
     if env_extra:
         env.update(env_extra)
     return subprocess.run([sys.executable, SCRIPT, *argv], capture_output=True,
@@ -225,7 +228,7 @@ with open(os.path.join(profdir, "token-inst.yaml"), "w", encoding="utf-8") as fp
     fp.write(f"base_url: {BASE}\ntoken: SECRET123\ntimeout: 30\ninsecure: true\n")
 
 r = run(["--version"])
-check("01 version", r.returncode == 0 and "2.1.0" in r.stdout, r.stdout + r.stderr)
+check("01 version", r.returncode == 0 and "2.2.0" in r.stdout, r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "whoami"])
 last_auth = state["requests"][-1][2]
@@ -423,6 +426,66 @@ check("36 use auto-register", r.returncode == 0 and "已切换当前活动项目
 
 r = run(["--config", creds_basic, "start", "W-1", "--dry-run"])
 check("37 start guard on non-todo", r.returncode == 1 and "已不是「未开始」" in r.stderr, r.stdout + r.stderr)
+
+# ---------- v2.2: 项目级配置 / 搜索硬护栏 ----------
+
+r = run(["--config", newcfg, "use", "STRUCTURING"])
+check("38 use back STRUCTURING", r.returncode == 0 and "已切换当前活动项目: STRUCTURING" in r.stdout, r.stdout + r.stderr)
+
+tpl_custom = "project = {project} AND status = Working AND assignee in (currentUser()) order by updated DESC"
+r = run(["--config", newcfg, "pconfig", "STRUCTURING", "--default-jql", tpl_custom])
+pj = os.path.join(PROJCFG, "STRUCTURING.yaml")
+check("39 pconfig set", r.returncode == 0 and os.path.exists(pj) and tpl_custom in open(pj, encoding="utf-8").read(),
+      f"rc={r.returncode}\n{r.stdout}{r.stderr}")
+
+r = run(["--config", newcfg, "pconfig"])
+check("40a pconfig list", r.returncode == 0 and "STRUCTURING.yaml" in r.stdout and "使用 STRUCTURING.yaml" in r.stdout,
+      r.stdout + r.stderr)
+r = run(["--config", newcfg, "pconfig", "BPM"])
+check("40b pconfig show unset", r.returncode == 0 and "（未配置）" in r.stdout, r.stdout + r.stderr)
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"])
+jql = last_search_jql()
+check("41 search uses project config",
+      r.returncode == 0 and "模板: 项目配置" in r.stdout
+      and jql == "project = STRUCTURING AND status = Working AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+with open(newcfg, "a", encoding="utf-8") as fp:
+    fp.write("default_jql: project = {project} AND status != 未开始 AND assignee in (currentUser()) order by updated DESC\n")
+r = run(["--config", newcfg, "use", "BPM"])
+check("42a use BPM", r.returncode == 0, r.stdout + r.stderr)
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"])
+jql = last_search_jql()
+check("42b search uses global config", r.returncode == 0 and "模板: 全局配置" in r.stdout
+      and jql == "project = BPM AND status != 未开始 AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+r = run(["--config", newcfg, "search", "--jql", "resolution = Unresolved AND assignee in (currentUser())"])
+check("43a guard blocks cross-project jql", r.returncode == 1 and "未限定项目" in r.stderr, r.stdout + r.stderr)
+r = run(["--config", newcfg, "search", "--jql", "resolution = Unresolved AND assignee in (currentUser())", "--max", "2", "--all-projects"])
+check("43b --all-projects allows", r.returncode == 0, r.stdout + r.stderr)
+
+r = run(["--config", newcfg, "search", "--jql", "project = STRUCTURING AND resolution = Unresolved", "--max", "2"])
+check("44a hint other project", r.returncode == 0 and "[提示]" in r.stderr and "当前活动项目" in r.stderr, r.stdout + r.stderr)
+r = run(["--config", newcfg, "search", "--jql", "project = BPM AND resolution = Unresolved", "--max", "2"])
+check("44b no hint own project", r.returncode == 0 and "[提示]" not in r.stderr, r.stdout + r.stderr)
+
+plain = os.path.join(BASE_TMP, "plain.yaml")
+with open(plain, "w", encoding="utf-8") as fp:
+    fp.write(f"base_url: {BASE}\nusername: tester\npassword: pw123\nactive_project: T\n")
+state["requests"].clear()
+r = run(["--config", plain, "search", "--max", "2"])
+jql = last_search_jql()
+check("45 builtin fallback", r.returncode == 0 and "模板: 内置默认" in r.stdout
+      and jql == "project = T AND resolution = Unresolved AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+r = run(["--config", newcfg, "pconfig", "STRUCTURING", "--clear"])
+check("46 pconfig clear", r.returncode == 0 and "已删除项目配置" in r.stdout and not os.path.exists(pj),
+      r.stdout + r.stderr)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n===== {len(results) - len(failed)}/{len(results)} PASS =====")

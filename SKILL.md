@@ -27,9 +27,11 @@ version: 2.0.0
 ```
 init [--check]                           # 初始化向导 / 体检（首次必跑）
 use [KEY]                                # 查看/切换当前活动项目
+pconfig [KEY] [--default-jql '…']        # 项目级拉单模板（项目配置>全局配置>内置默认）
 whoami                                   # 身份/实例/活动项目（冒烟首选）
 search                                   # 不传条件 = 当前活动项目我的未解决
 search --jql '…' [--max|--all] [--format table|json|md]   # 拉清单，自动分页
+                                                          # 手写 JQL/链接未限定 project 会被拦截；跨项目要 --all-projects
 search --project KEY                     # 临时只看某项目（ALL=不限）
 search --url '…/issues/?jql=…'           # 贴过滤器链接
 issue KEY [--save f.md]                  # 详情+评论+附件
@@ -59,8 +61,9 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 3. 照常 start → 修 → resolve；交回方式按约定（自动转报告人 / `--assign` / 转回原负责人）
 4. 留痕：`comment` 一条「代为处理」；关键结论也写进评论
 
-## 铁律（写操作三保险）
+## 铁律（写操作三保险 + 范围）
 
+- **范围铁律**：默认只查当前活动项目。用户没明说「跨项目/所有项目」时：不得用 `--all-projects`、不得写不带 project 的 JQL、不得 `--project` 别的项目；查询指向别的项目先停下确认或先 `use` 切换。工具对手写 JQL/链接已有硬护栏，不要尝试绕过。
 - start / resolve / assign / comment **永远等用户明确指令**；拿不准先 `--dry-run` 预演给用户过目（零写请求，打印完整 payload + 字段清单）
 - 执行后**必须读回验证**（脚本自动做：状态 + 每个已填字段逐项核对）
 - transition id / 字段 id / 下拉词表**永远运行时发现**，不硬编码；词表填错会在 POST 前中止并列出可选项
@@ -74,6 +77,7 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 | 未初始化 / 未设活动项目 | `init` 向导 / `use <项目>`；`init --check` 自查 |
 | 当前状态已不是「未开始」 | start 安全护栏：单已处理中；确要流转用 `--transition-id` |
 | `当前账号对 X 无任何可用流转` | 不是你的单 → `assign X --to me` |
+| JQL 里 `status = 未开始` 静默返 0 | 本实例用内部名：`status = "Initial"`（=未开始；保留字须加引号） |
 | 无「接受/解决」类流转或歧义 | `transitions KEY` 看候选 → `--transition-id` |
 | 必填未填 | `--dry-run` 看屏幕字段清单 → `--field '标签=值'` |
 | 贴 browse 链接报无 jql | 改用 `/issues/?jql=` 过滤器链接 |

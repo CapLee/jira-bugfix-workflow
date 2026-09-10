@@ -12,10 +12,13 @@
       键: base_url / username / password，可选 token（Bearer）/ insecure / timeout /
           projects（登记的项目）/ active_project（当前活动项目）/ default_jql（可选）。
 
-子命令: init / use（初始化与活动项目）/ search / issue / transitions / editmeta /
-        start / resolve / assign / comment / whoami / projects / fields / attachments
+子命令: init / use / pconfig（初始化、活动项目、项目级配置）/ search / issue /
+        transitions / editmeta / start / resolve / assign / comment / whoami /
+        projects / fields / attachments
 写操作（start/resolve/assign/comment）均支持 --dry-run 预演，执行后自动读回验证。
 不带 --jql/--url/--project 的 search 默认聚焦「当前活动项目」（use 切换）；
+未限定 project 的 --jql/--url 查询默认被拦截（确要跨项目需显式 --all-projects）。
+拉单模板优先级：项目配置（hermes/jira-project-configs/<KEY>.yaml）> 全局配置（default_jql）> 内置默认。
 纯数字单号（如 issue 25）自动补活动项目前缀。
 每个子命令 --help 有详细用法。错误退出码 1，正常 0。
 """
@@ -33,7 +36,7 @@ import urllib.request
 from urllib.parse import urlencode, urlparse, parse_qs
 
 PROG = os.path.basename(sys.argv[0])
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # 运行期配置（main 里填充）：base / user / pw / token / insecure / timeout /
 #   projects / active / default_jql / path
@@ -333,6 +336,35 @@ def _warn_project(key):
               f"（如需切换: {PROG} use {proj}）", file=sys.stderr)
 
 
+def _project_cfg_dir():
+    return os.environ.get("JIRA_PROJECT_CONFIGS_DIR") or os.path.join(_hermes_dir(), "jira-project-configs")
+
+
+def _project_cfg_path(project):
+    """在项目配置目录里按 <KEY>.yaml 查找（不区分大小写；目录不存在返回 None）。"""
+    d = _project_cfg_dir()
+    if not os.path.isdir(d) or not project:
+        return None
+    want = project.upper()
+    for f in os.listdir(d):
+        base, ext = os.path.splitext(f)
+        if base.upper() == want and ext.lower() in (".yaml", ".yml"):
+            return os.path.join(d, f)
+    return None
+
+
+def _load_project_cfg(project):
+    """读取项目级配置（返回 dict, 路径）。文件不存在/读取失败按空处理。"""
+    p = _project_cfg_path(project)
+    if not p:
+        return {}, None
+    try:
+        return _read_flat(p), p
+    except OSError as e:
+        print(f"[警告] 项目配置读取失败: {p}（{e}）", file=sys.stderr)
+        return {}, p
+
+
 # ---------------- search ----------------
 
 DEFAULT_JQL = "project = {project} AND resolution = Unresolved AND assignee in (currentUser()) order by updated DESC"
@@ -350,21 +382,29 @@ def _jql_from_url(u):
 
 
 def _build_default_jql(project):
-    """生成默认 JQL：project 为 ALL/*/全部 时不限定项目；可用配置 default_jql 覆盖模板（保留 {project} 占位符）。"""
-    tpl = C.get("default_jql") or DEFAULT_JQL
+    """生成默认 JQL，返回 (jql, 模板来源)。模板优先级：项目配置 > 全局配置(default_jql) > 内置默认。"""
+    pcfg, ppath = ({}, None)
+    if project not in ("ALL", "*", "全部"):
+        pcfg, ppath = _load_project_cfg(project)
+    if pcfg.get("default_jql"):
+        tpl, src = pcfg["default_jql"], f"项目配置 {os.path.basename(ppath)}"
+    elif C.get("default_jql"):
+        tpl, src = C["default_jql"], "全局配置"
+    else:
+        tpl, src = DEFAULT_JQL, "内置默认"
     if project in ("ALL", "*", "全部"):
         if "{project}" not in tpl:
-            return tpl
+            return tpl, src
         s = re.sub(r"project\s*=\s*\{project\}\s*AND\s+", "", tpl, count=1, flags=re.I)
         if s == tpl:
             s = re.sub(r"project\s*=\s*\{project\}", "", tpl, count=1, flags=re.I)
         s = re.sub(r"^\s*AND\s+", "", s.strip(), flags=re.I).strip()
         if "{project}" in s:
-            die("default_jql 里的 project 条件无法移除：改成「project = {project} AND …」形式，或显式 --jql")
-        return s
+            die("拉单模板里的 project 条件无法移除：改成「project = {project} AND …」形式，或显式 --jql")
+        return s, src
     if "{project}" not in tpl:
-        die("配置的 default_jql 缺 {project} 占位符，无法套用当前项目；请显式 --jql 或修改配置（docs/01）")
-    return tpl.replace("{project}", project)
+        die(f"拉单模板（{src}）缺 {{project}} 占位符，无法套用当前项目；请显式 --jql 或修改配置（docs/01）")
+    return tpl.replace("{project}", project), src
 
 
 def _fetch_issues(jql, fields, max_n, all_flag):
@@ -387,6 +427,7 @@ def _fetch_issues(jql, fields, max_n, all_flag):
 
 
 def cmd_search(args):
+    explicit = bool(args.url or args.jql)
     if args.url:
         jql = _jql_from_url(args.url)
     elif args.jql:
@@ -398,11 +439,22 @@ def cmd_search(args):
         if not proj:
             die(f"未给查询条件且未设置活动项目：先用 {PROG} use <项目> 设置（或 --jql/--url/--project 显式指定；"
                 f"--project ALL=不限项目）")
-        jql = _build_default_jql(proj)
+        jql, tpl_src = _build_default_jql(proj)
         label = "全部" if proj in ("ALL", "*", "全部") else proj
         src = "指定项目" if args.project else "活动项目"
-        note = f"[项目] {src}: {label}；JQL: {jql}"
+        note = f"[项目] {src}: {label}（模板: {tpl_src}）；JQL: {jql}"
         print(note, file=(sys.stderr if args.format == "json" else sys.stdout))
+    if explicit:
+        # 防手滑/防 AI 跑偏：未限定项目的查询默认拦截；指向别的项目时给提示
+        act = (C.get("active") or "").strip()
+        if act and act.upper() not in ("ALL", "*", "全部") and not args.all_projects:
+            if not re.search(r"project\s*(?:=|!=|\bin\b)", jql, flags=re.I):
+                die(f"该查询未限定项目，会跨【全部项目】拉单。当前活动项目是 {act}：\n"
+                    f"  · 只查当前项目：直接运行不带条件的 search，或把 project = {act} 写进 JQL\n"
+                    f"  · 确实要跨项目搜索：显式加 --all-projects")
+            if act.upper() not in jql.upper():
+                print(f"[提示] 查询未指向当前活动项目 {act}——若只是想查其它项目，先 {PROG} use <项目> 切换；"
+                      f"确认为跨项目搜索请加 --all-projects（可消除本提示）", file=sys.stderr)
     issues, total = _fetch_issues(jql, _fmt_fields_csv(args.fields), args.max, args.all)
     rows = []
     for it in issues:
@@ -711,6 +763,10 @@ def _init_check(path):
     active = (creds.get("active_project") or "").strip()
     print(f"  已登记项目({len(projects)}): {', '.join(projects) if projects else '（无）→ 运行 init 登记'}")
     print(f"  当前活动项目: {active if active else '（未设置）→ ' + PROG + ' use <项目>'}")
+    pd = _project_cfg_dir()
+    pf = sorted(f for f in os.listdir(pd) if f.lower().endswith((".yaml", ".yml"))) if os.path.isdir(pd) else []
+    if pf:
+        print(f"  项目级拉单模板: {', '.join(pf)}（目录: {pd}）")
     print("  状态: 已初始化 ✓")
 
 
@@ -893,6 +949,54 @@ def cmd_use(args):
     tail = f"（新登记，共 {len(C['projects'])} 个）" if is_new else ""
     print(f"已切换当前活动项目: {key} {tail}".rstrip())
     print("之后不带 --jql/--url/--project 的 search 默认只查它；其他项目的单会给出提示（--project KEY 可临时换）。")
+
+
+def cmd_pconfig(args):
+    proj = (args.project or C.get("active") or "").strip().upper()
+    d = _project_cfg_dir()
+    if args.set_default_jql is not None or args.clear:
+        if not proj:
+            die(f"未指定项目：pconfig <项目KEY>（或先 {PROG} use 设置活动项目）")
+        p = _project_cfg_path(proj) or os.path.join(d, proj + ".yaml")
+        if args.clear:
+            if os.path.exists(p):
+                os.remove(p)
+                print(f"已删除项目配置: {p}")
+            else:
+                print(f"（无项目配置，无需删除）: {p}")
+            return
+        if "{project}" not in args.set_default_jql:
+            die("模板里必须包含 {project} 占位符（例如: project = {project} AND resolution = Unresolved order by updated DESC）")
+        _update_cfg(p, {"default_jql": args.set_default_jql})
+        print(f"已写入项目配置: {p}")
+        print(f"  default_jql: {args.set_default_jql}")
+        print(f"（{proj} 的拉单将优先用该模板；优先级：项目配置 > 全局配置 > 内置默认）")
+        return
+    if args.project:
+        p = _project_cfg_path(proj)
+        print(f"项目 {proj} 的项目配置: {p or '（未配置）'}")
+        if p:
+            with open(p, encoding="utf-8") as fp:
+                print(fp.read().strip())
+        g = C.get("default_jql")
+        print(f"生效顺序: 项目配置（{'有' if p else '无'}）> 全局配置（{'有 default_jql' if g else '无'}）> 内置默认")
+        print(f"内置默认: {DEFAULT_JQL}")
+        return
+    print(f"项目配置目录: {d}")
+    files = sorted(f for f in os.listdir(d)
+                   if f.lower().endswith((".yaml", ".yml"))) if os.path.isdir(d) else []
+    if not files:
+        print("（空）—— 用 pconfig <项目KEY> --default-jql '…' 创建；或直接编辑该目录下的 <KEY>.yaml")
+    for f in files:
+        print(f"  {f}")
+    act = (C.get("active") or "").strip()
+    if act:
+        p = _project_cfg_path(act)
+        if p:
+            print(f"当前活动项目 {act}: 使用 {os.path.basename(p)}")
+        else:
+            fallback = "全局配置" if C.get("default_jql") else "内置默认"
+            print(f"当前活动项目 {act}: （无项目配置，落回{fallback}）")
 
 
 # ---------------- 探查 / 附件 ----------------
@@ -1141,6 +1245,13 @@ def main():
     us.add_argument("target", nargs="?", help="项目 KEY（或列表里的序号；支持前缀模糊匹配）")
     us.set_defaults(fn=cmd_use)
 
+    pc = sub.add_parser("pconfig", help="项目级配置（拉单模板）：查看/设置；优先级 项目配置>全局配置>内置默认")
+    pc.add_argument("project", nargs="?", help="项目 KEY（省略=列目录；配合 --default-jql/--clear 时默认用当前活动项目）")
+    pc.add_argument("--default-jql", dest="set_default_jql", metavar="JQL",
+                    help="写入该项目默认拉单模板（必须含 {project} 占位符）")
+    pc.add_argument("--clear", action="store_true", help="删除该项目的配置文件")
+    pc.set_defaults(fn=cmd_pconfig)
+
     s = sub.add_parser("search", help="JQL 搜索 bug 清单（超 100 自动分页；不传条件=当前活动项目我的未解决）")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--jql", help="原始 JQL，如 'project = X AND resolution = Unresolved'")
@@ -1148,6 +1259,8 @@ def main():
     g.add_argument("--project", metavar="KEY", help="本次只查该项目（ALL=不限项目；不改活动项目）")
     s.add_argument("--max", type=int, default=100, help="最多取多少张（默认 100）")
     s.add_argument("--all", action="store_true", help="取全部（忽略 --max）")
+    s.add_argument("--all-projects", action="store_true",
+                   help="显式允许跨项目搜索（未限定 project 的 --jql/--url 默认被拦截）")
     s.add_argument("--format", choices=["table", "json", "md"], default="table")
     s.add_argument("--fields", default="key,summary,status,priority,issuetype,updated,assignee",
                    help="逗号分隔字段列表")

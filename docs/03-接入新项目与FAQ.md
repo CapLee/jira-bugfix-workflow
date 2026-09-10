@@ -45,9 +45,12 @@
 | `当前账号对 X 无任何可用流转` | 单子经办人不是你（工作流限制）→ `assign X --to me` 接管；或请原经办人转给你 |
 | `未初始化` / 缺字段 | 跑 `python3 jira.py init`（向导）；自查 `init --check` |
 | `未设置活动项目` | `python3 jira.py use <项目>` 设置；或 --jql/--url/--project 显式指定 |
+| `该查询未限定项目…被拦截` | 护栏：手写 JQL/链接没带 project；补 `project = X`，或用户确认跨项目后加 `--all-projects` |
+| `查询未指向当前活动项目`（提示） | 检查 JQL 是否写错项目；临时看别的项目先 `use` 切换（确要跨项目加 `--all-projects`） |
 | `当前状态「X」已不是「未开始」` | start 安全护栏：单已处理中/终态；确要流转用 `--transition-id` |
 | 项目名记不住 / 想换项目 | `use` 看已登记清单（序号/前缀切换）；`projects --query` 全量搜 |
 | `HTTP 400 … “resolution”域中没有…` | 你手写 JQL 里用了本项目没有的 resolution 词（如 Fixed）→ 用 `resolution is not EMPTY` 或 `statusCategory = done` |
+| JQL 状态条件**静默返 0**（明明有数据） | 本实例状态名本地化：中文「未开始」在 JQL 中不命中，须用内部名并加引号 `status = "Initial"`；其余状态名以实测为准（Working / ST Check 等英文名可直接用） |
 | 选项值不在词表 | resolve 自动列出可选项 → 换词重跑（**已在 POST 前中止，单子未动**） |
 | 「接受/解决」类流转不唯一或找不到 | 输出会列出候选 → `--transition-id <id>` 强制指定（先 `transitions KEY` 查 id） |
 | 必填字段未填，已中止 | 预检会列出缺失字段 id+名称 → `--field "标签=值"` 补齐；`--dry-run` 可先看全部字段清单 |
