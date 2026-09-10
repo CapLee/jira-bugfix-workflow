@@ -10,6 +10,7 @@ JIRA Bug 处理「纯数据流」命令行工具：**拉清单 → 读详情 →
 - **动态发现，零硬编码**：transition id、自定义字段 id、下拉词表全部运行时从 JIRA 读取；**换项目、换实例不用改代码**；选项填错在请求发出前中止并列出可选项（不会盲发 400）
 - **通用**：JIRA Server / Data Center 8.x 开箱即用；可选 Bearer token（Server PAT）与 Cloud「邮箱+API Token」认证
 - **多实例/多账号**：`--profile 名字` 一键切换 JIRA 实例（凭据按 profile 分开存，互不干扰）
+- **初始化向导 + 活动项目**：`init` 一次配好（账号 → 验证 → 勾选项目 → 设活动项目）；`use` 一键切换项目，**不切换时默认永远聚焦当前活动项目**（不带条件的 `search`、纯数字单号都认它）
 - **支持改别人的单**：`assign` 接管（`--to me`）/转派、`comment` 协作评论；权限不足时给出明确的下一步提示
 - **写操作三保险**：`--dry-run` 预演（不提交，可看将发送的完整 payload 与字段清单）+ 选项词表预校验 + 执行后自动读回验证（状态/字段逐项核对）
 - **零依赖**：Python 3 标准库（urllib），Windows / macOS / Linux 通用
@@ -22,30 +23,28 @@ JIRA Bug 处理「纯数据流」命令行工具：**拉清单 → 读详情 →
 git clone https://github.com/CapLee/jira-bugfix-workflow.git
 # 或只拷贝 scripts/jira.py 到任何目录
 
-# 2. 配凭据（一次性，详见 docs/01-配置指南.md）
-#    Windows 默认读 %LOCALAPPDATA%\hermes\jira-api-creds.yaml
-#    macOS/Linux 默认读 ~/hermes/jira-api-creds.yaml
-#    也可 export JIRA_CREDS_PATH=/任意/路径/creds.yaml
+# 2. 初始化（一次性，详见 docs/01-配置指南.md）—— 交互向导：填账号 → 现场验证 → 勾选项目 → 设活动项目
+python3 scripts/jira.py init
+#    不想交互也可以：直接建 %LOCALAPPDATA%\hermes\jira-api-creds.yaml（macOS/Linux ~/hermes/），填 base_url/username/password
 #    多实例：凭据放 hermes/jira-profiles/<名字>.yaml，用 --profile <名字> 切换
-mkdir -p ~/hermes
-cat > ~/hermes/jira-api-creds.yaml <<'EOF'
-base_url: https://ticket.你的公司.com
-username: 你的JIRA登录名
-password: 你的密码
-EOF
 
-# 3. 冒烟验证：先看身份，再拉你未解决的 bug
-python3 scripts/jira.py whoami
-python3 scripts/jira.py search --jql 'resolution = Unresolved AND assignee in (currentUser()) order by updated DESC'
+# 3. 冒烟验证 + 日常起手式
+python3 scripts/jira.py init --check   # 体检：账号 / 认证 / 已登记项目 / 当前活动项目，一眼看清
+python3 scripts/jira.py search         # = 当前活动项目里我的未解决 bug（不切换就一直在它上面干活）
+python3 scripts/jira.py use BPM        # 切换活动项目（不带参数=看已登记清单）
 ```
 
 ## 常用命令速览
 
 ```
-python3 jira.py whoami                                        # 当前登录身份/实例（冒烟验证首选）
+python3 jira.py init [--check]                                # 初始化向导 / 体检（首次必跑）
+python3 jira.py use [项目KEY|序号]                             # 查看/切换当前活动项目（前缀模糊可）
+python3 jira.py whoami                                        # 身份/实例/活动项目（冒烟首选）
+python3 jira.py search                                        # 不传条件 = 当前活动项目我的未解决
 python3 jira.py search --jql 'JQL' [--max 100] [--all] [--format table|json|md]
 python3 jira.py search --url 'https://主机/issues/?jql=…'      # 直接贴过滤器链接（自动提取 JQL）
-python3 jira.py issue KEY [--save x.md]                       # 详情+评论+附件
+python3 jira.py search --project BPM                          # 临时只看某项目（ALL=不限；不改活动项目）
+python3 jira.py issue KEY [--save x.md]                       # 详情+评论+附件（单号可只写数字=当前活动项目）
 python3 jira.py attachments KEY [--save-dir 目录]              # 下载附件（截图等）
 python3 jira.py transitions KEY                               # 看可用状态流转
 python3 jira.py start KEY [--dry-run]                         # 「接受」（未开始→Working）
@@ -127,7 +126,7 @@ $ python3 jira.py resolve X-3 --impact "…" --cause "需求理解偏差" --solu
 ## 开发者自测（改完 jira.py 跑一遍）
 
 ```bash
-python3 scripts/selftest_offline.py    # 离线 mock：26 项断言，零真实请求，退出码 0 = 全过
+python3 scripts/selftest_offline.py    # 离线 mock：41 项断言，零真实请求，退出码 0 = 全过
 ```
 
 ## License

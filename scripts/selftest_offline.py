@@ -4,8 +4,10 @@
 
 零外部依赖、零真实请求：不会碰任何真实 JIRA。
 用法:  python3 scripts/selftest_offline.py     （退出码 0 = 全过）
-覆盖: 认证(Basic/Bearer)、profile、--url 解析、自动分页、429/5xx 重试、dry-run 零写入、
-      resolve 读回校验、assign/comment/attachments、各类错误路径。改完 jira.py 跑一遍。
+覆盖: 认证(Basic/Bearer)、profile、init 初始化向导、use 活动项目切换、
+      --url 解析、自动分页、429/5xx 重试、dry-run 零写入、resolve 读回校验、
+      assign/comment/attachments、纯数字单号、跨项目提示、各类错误路径。
+      改完 jira.py 跑一遍。
 """
 import base64
 import json
@@ -100,7 +102,15 @@ class H(BaseHTTPRequestHandler):
                                               "allowedValues": [{"id": "5", "value": "无需额外措施"}]},
                     }
                 return self._json(200, {"transitions": ts})
-            if path == "/rest/api/2/issue/T-1":
+            if path == "/rest/api/2/issue/W-1":
+                return self._json(200, {"key": "W-1", "fields": {
+                    "status": {"name": "Working", "statusCategory": {"key": "indeterminate"}},
+                    "resolution": None}})
+            if path == "/rest/api/2/issue/W-1/transitions":
+                return self._json(200, {"transitions": [
+                    {"id": "11", "name": "解决", "to": {"name": "ST Check", "statusCategory": {"key": "indeterminate"}}}]})
+            if path in ("/rest/api/2/issue/T-1", "/rest/api/2/issue/STRUCTURING-1"):
+                k = path.rsplit("/", 1)[-1]
                 fields = {
                     "status": {"name": "Working"}, "resolution": None, "assignee": state["assignee"],
                     "summary": "示例 bug", "description": "步骤A\n\n期望X\n\n实际Y",
@@ -113,7 +123,7 @@ class H(BaseHTTPRequestHandler):
                     "customfield_13209": "范围X", "customfield_15817": {"value": "需求理解偏差"},
                     "customfield_15818": {"value": "调整UI/样式"}, "customfield_15819": {"value": "无需额外措施"},
                 }
-                return self._json(200, {"key": "T-1", "fields": fields})
+                return self._json(200, {"key": k, "fields": fields})
             if path == "/rest/api/2/issue/NOKEY":
                 return self._json(404, {"errorMessages": ["Issue does not exist or you do not have permission to see it."]})
             if path == "/rest/api/2/issue/T-1/comment/9001":
@@ -122,7 +132,8 @@ class H(BaseHTTPRequestHandler):
                 return self._json(200, [{"name": "target1", "displayName": "目标人乙"}])
             if path == "/rest/api/2/project":
                 return self._json(200, [{"id": "1", "key": "T", "name": "测试项目"},
-                                        {"id": "2", "key": "STRUCTURING", "name": "结构化文档"}])
+                                        {"id": "2", "key": "STRUCTURING", "name": "结构化文档"},
+                                        {"id": "3", "key": "BPM", "name": "BPM流程"}])
             if path == "/rest/api/2/field":
                 return self._json(200, [{"id": "customfield_13209", "name": "影响范围", "custom": True,
                                          "schema": {"type": "textarea"}},
@@ -179,7 +190,8 @@ def run(argv, env_extra=None):
     if env_extra:
         env.update(env_extra)
     return subprocess.run([sys.executable, SCRIPT, *argv], capture_output=True,
-                          text=True, encoding="utf-8", env=env, cwd=BASE_TMP)
+                          text=True, encoding="utf-8", env=env, cwd=BASE_TMP,
+                          stdin=subprocess.DEVNULL)
 
 
 results = []
@@ -188,6 +200,17 @@ results = []
 def check(name, cond, detail=""):
     results.append((name, bool(cond)))
     print(("PASS " if cond else "FAIL ") + name + ("" if cond else f"   <<< {detail}"))
+
+
+def last_search_jql():
+    for method, path, auth in reversed(state["requests"]):
+        if path.startswith("/rest/api/2/search"):
+            return parse_qs(urlparse(path).query)["jql"][0]
+    return None
+
+
+def read_cfg(path):
+    return open(path, encoding="utf-8").read()
 
 
 creds_basic = os.path.join(BASE_TMP, "jira-api-creds.yaml")
@@ -202,7 +225,7 @@ with open(os.path.join(profdir, "token-inst.yaml"), "w", encoding="utf-8") as fp
     fp.write(f"base_url: {BASE}\ntoken: SECRET123\ntimeout: 30\ninsecure: true\n")
 
 r = run(["--version"])
-check("01 version", r.returncode == 0 and "2.0.0" in r.stdout, r.stdout + r.stderr)
+check("01 version", r.returncode == 0 and "2.1.0" in r.stdout, r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "whoami"])
 last_auth = state["requests"][-1][2]
@@ -322,6 +345,84 @@ check("25 global flags", r.returncode == 0 and "身份:" in r.stdout, r.stdout +
 
 r = run(["--config", creds_basic, "start", "T-1", "--dry-run"])
 check("26 start dry-run", r.returncode == 0 and "[DRY-RUN]" in r.stdout, r.stdout + r.stderr)
+
+# ---------- v2.1: init / use / 活动项目 ----------
+
+newcfg = os.path.join(BASE_TMP, "init-test.yaml")
+
+r = run(["--config", os.path.join(BASE_TMP, "none.yaml"), "init", "--check"])
+check("27 init check missing", r.returncode == 1 and "未初始化" in r.stdout, r.stdout + r.stderr)
+
+r = run(["--config", newcfg, "init", "--base-url", BASE, "--username", "tester",
+         "--password", "pw123", "--projects", "T,STRUCTURING", "--use", "STRUCTURING"])
+txt = read_cfg(newcfg) if os.path.exists(newcfg) else ""
+check("28 init create (non-interactive)",
+      r.returncode == 0 and "[验证] 身份: 测试员甲" in r.stdout and "已登记项目(2): T, STRUCTURING" in r.stdout
+      and "projects: T,STRUCTURING" in txt and "active_project: STRUCTURING" in txt and "password: pw123" in txt,
+      f"rc={r.returncode}\n{r.stdout}\n{r.stderr}\n--- cfg ---\n{txt}")
+
+r = run(["--config", newcfg, "init", "--check"])
+check("28b init check ok", r.returncode == 0 and "已初始化 ✓" in r.stdout and "当前活动项目: STRUCTURING" in r.stdout,
+      r.stdout + r.stderr)
+
+r = run(["--config", newcfg, "whoami"])
+check("29 whoami active", r.returncode == 0 and "当前活动项目: STRUCTURING" in r.stdout, r.stdout + r.stderr)
+
+r = run(["--config", newcfg, "use"])
+check("30 use list", r.returncode == 0 and "当前活动项目: STRUCTURING" in r.stdout
+      and "T" in r.stdout and "STRUCTURING" in r.stdout, r.stdout + r.stderr)
+
+r = run(["--config", newcfg, "use", "1"])
+txt = read_cfg(newcfg)
+check("30b use by number", r.returncode == 0 and "已切换当前活动项目: T" in r.stdout
+      and "active_project: T" in txt, f"rc={r.returncode}\n{r.stdout}\n{txt}")
+
+r = run(["--config", newcfg, "use", "struc"])
+txt = read_cfg(newcfg)
+check("30c use by prefix", r.returncode == 0 and "已切换当前活动项目: STRUCTURING" in r.stdout
+      and "active_project: STRUCTURING" in txt, f"rc={r.returncode}\n{r.stdout}\n{txt}")
+
+r = run(["--config", newcfg, "use", "nope"])
+check("30d use invalid", r.returncode == 1 and "不在已登记列表" in r.stderr, r.stdout + r.stderr)
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--max", "2"])
+jql = last_search_jql()
+check("31 search default = active project",
+      r.returncode == 0 and "[项目] 活动项目: STRUCTURING" in r.stdout
+      and jql == "project = STRUCTURING AND resolution = Unresolved AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+state["requests"].clear()
+r = run(["--config", newcfg, "search", "--project", "ALL", "--max", "2"])
+jql = last_search_jql()
+check("32 search --project ALL", r.returncode == 0
+      and jql == "resolution = Unresolved AND assignee in (currentUser()) order by updated DESC",
+      f"rc={r.returncode} jql={jql}\n{r.stdout}\n{r.stderr}")
+
+noact = os.path.join(BASE_TMP, "noactive.yaml")
+with open(noact, "w", encoding="utf-8") as fp:
+    fp.write(f"base_url: {BASE}\nusername: tester\npassword: pw123\n")
+r = run(["--config", noact, "search"])
+check("33 search no active", r.returncode == 1 and "未设置活动项目" in r.stderr, r.stdout + r.stderr)
+
+state["requests"].clear()
+r = run(["--config", newcfg, "issue", "1"])
+paths = [x[1] for x in state["requests"]]
+check("34 bare number key", r.returncode == 0 and any("/rest/api/2/issue/STRUCTURING-1" in p for p in paths)
+      and "[提示]" not in r.stderr, f"rc={r.returncode} paths={paths}\n{r.stderr}")
+
+r = run(["--config", newcfg, "issue", "T-1"])
+check("35 cross-project hint", r.returncode == 0 and "[提示]" in r.stderr
+      and "当前活动项目是 STRUCTURING" in r.stderr, r.stdout + r.stderr)
+
+r = run(["--config", newcfg, "use", "BPM"])
+txt = read_cfg(newcfg)
+check("36 use auto-register", r.returncode == 0 and "已切换当前活动项目: BPM" in r.stdout
+      and "T,STRUCTURING,BPM" in txt, f"rc={r.returncode}\n{r.stdout}\n{txt}")
+
+r = run(["--config", creds_basic, "start", "W-1", "--dry-run"])
+check("37 start guard on non-todo", r.returncode == 1 and "已不是「未开始」" in r.stderr, r.stdout + r.stderr)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n===== {len(results) - len(failed)}/{len(results)} PASS =====")

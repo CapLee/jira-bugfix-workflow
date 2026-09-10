@@ -20,7 +20,7 @@
 
 ## 2. 新 JIRA 环境接入检查清单
 
-1. **确认实例类型 + 认证**：`whoami` 直接测——能输出身份就通了。JIRA Server/DC 8.x 走 Basic；有 PAT 的实例可改用 `token:`（Bearer）；Cloud 用「邮箱+API Token」当 Basic（见 §4）
+1. **初始化 + 认证体检**：`init --check` 看配置状态（未初始化就 `init` 向导走一遍），`whoami` 能输出身份即认证通。JIRA Server/DC 8.x 走 Basic；有 PAT 的实例可改用 `token:`（Bearer）；Cloud 用「邮箱+API Token」当 Basic（见 §4）
 2. **凭据**：按文档 01 配置并冒烟。多套环境并存用 **profile**（`--profile 名字`），别共用一份凭据来回改
 3. **摸清项目**：`projects --query 关键词` 找到项目 key → `search --jql 'project = KEY …'` 验证能拉到单
 4. **一次看清状态机+字段+词表**（读操作，零风险）：
@@ -43,6 +43,10 @@
 | `凭据文件不存在` / `缺字段` | 路径或三键不全；`export JIRA_CREDS_PATH=…` 或 `--profile` 指定 |
 | `找不到 profile「xx」` | 按报错里列出的可用名字创建 `profiles/xx.yaml`（文件名必须=名字） |
 | `当前账号对 X 无任何可用流转` | 单子经办人不是你（工作流限制）→ `assign X --to me` 接管；或请原经办人转给你 |
+| `未初始化` / 缺字段 | 跑 `python3 jira.py init`（向导）；自查 `init --check` |
+| `未设置活动项目` | `python3 jira.py use <项目>` 设置；或 --jql/--url/--project 显式指定 |
+| `当前状态「X」已不是「未开始」` | start 安全护栏：单已处理中/终态；确要流转用 `--transition-id` |
+| 项目名记不住 / 想换项目 | `use` 看已登记清单（序号/前缀切换）；`projects --query` 全量搜 |
 | `HTTP 400 … “resolution”域中没有…` | 你手写 JQL 里用了本项目没有的 resolution 词（如 Fixed）→ 用 `resolution is not EMPTY` 或 `statusCategory = done` |
 | 选项值不在词表 | resolve 自动列出可选项 → 换词重跑（**已在 POST 前中止，单子未动**） |
 | 「接受/解决」类流转不唯一或找不到 | 输出会列出候选 → `--transition-id <id>` 强制指定（先 `transitions KEY` 查 id） |

@@ -9,15 +9,19 @@
       （macOS/Linux ~/hermes/...；环境变量 JIRA_CREDS_PATH 可覆盖）。
       多实例/多账号: --profile <名字> 读 profiles 目录 <名字>.yaml
       （默认 %LOCALAPPDATA%\\hermes\\jira-profiles\\，JIRA_PROFILES_DIR 可覆盖）。
-      键: base_url / username / password，可选 token（Bearer）/ insecure / timeout。
+      键: base_url / username / password，可选 token（Bearer）/ insecure / timeout /
+          projects（登记的项目）/ active_project（当前活动项目）/ default_jql（可选）。
 
-子命令: search / issue / transitions / editmeta / start / resolve / assign /
-        comment / whoami / projects / fields / attachments
+子命令: init / use（初始化与活动项目）/ search / issue / transitions / editmeta /
+        start / resolve / assign / comment / whoami / projects / fields / attachments
 写操作（start/resolve/assign/comment）均支持 --dry-run 预演，执行后自动读回验证。
+不带 --jql/--url/--project 的 search 默认聚焦「当前活动项目」（use 切换）；
+纯数字单号（如 issue 25）自动补活动项目前缀。
 每个子命令 --help 有详细用法。错误退出码 1，正常 0。
 """
 import argparse
 import base64
+import getpass
 import json
 import os
 import re
@@ -29,9 +33,10 @@ import urllib.request
 from urllib.parse import urlencode, urlparse, parse_qs
 
 PROG = os.path.basename(sys.argv[0])
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
-# 运行期配置（main 里填充）：base / user / pw / token / insecure / timeout / path
+# 运行期配置（main 里填充）：base / user / pw / token / insecure / timeout /
+#   projects / active / default_jql / path
 C = {}
 
 
@@ -79,8 +84,11 @@ def _profiles_dir():
     return os.environ.get("JIRA_PROFILES_DIR") or os.path.join(_hermes_dir(), "jira-profiles")
 
 
-def resolve_creds_path(args):
-    """凭据文件定位：--config > --profile/JIRA_PROFILE > JIRA_CREDS_PATH > 默认路径。"""
+def resolve_creds_path(args, for_init=False):
+    """凭据文件定位：--config > --profile/JIRA_PROFILE > JIRA_CREDS_PATH > 默认路径。
+
+    for_init=True 时 profile 文件不存在也不报错（init 可直接创建新 profile）。
+    """
     if args.config and args.profile:
         die("--config 与 --profile 只能用一个（--config 指具体文件，--profile 指 profiles 目录里的名字）")
     if args.config:
@@ -92,6 +100,8 @@ def resolve_creds_path(args):
             p = os.path.join(d, name + ext)
             if os.path.exists(p):
                 return p
+        if for_init:
+            return os.path.join(d, name + ".yaml")
         avail = []
         if os.path.isdir(d):
             avail = sorted(f[:-5] if f.lower().endswith(".yaml") else f[:-4]
@@ -101,10 +111,8 @@ def resolve_creds_path(args):
     return os.environ.get("JIRA_CREDS_PATH") or _default_creds_path()
 
 
-def load_creds(path):
-    if not os.path.exists(path):
-        die(f"凭据文件不存在: {path}\n请创建（base_url/username/password 三键）后重试；"
-            f"多实例可用 --profile（见 docs/01）。")
+def _read_flat(path):
+    """宽松读取 flat yaml（不做完整性校验），键统一小写。"""
     creds = {}
     with open(path, encoding="utf-8") as f:
         for raw in f:
@@ -123,19 +131,55 @@ def load_creds(path):
             while (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")) or (v.startswith("<") and v.endswith(">")):
                 v = v[1:-1].strip()
             creds[k.strip().lower()] = v
+    return creds
+
+
+def _update_cfg(path, updates):
+    """把键值写回配置文件：已有键原地更新，新键追加；其余内容（含注释）原样保留。原子写入。"""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    lines = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    found = set()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)([A-Za-z_][\w-]*)\s*:", line)
+        if m and m.group(2).lower() in updates:
+            k = m.group(2).lower()
+            lines[i] = f"{m.group(1)}{k}: {updates[k]}\n"
+            found.add(k)
+    for k, v in updates.items():
+        if k not in found:
+            lines.append(f"{k}: {v}\n")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, path)
+
+
+def load_creds(path):
+    if not os.path.exists(path):
+        die(f"凭据文件不存在: {path}\n请先运行初始化向导: {PROG} init"
+            f"（账号 → 验证 → 登记项目 → 设活动项目）；多实例可用 --profile（见 docs/01）。")
+    creds = _read_flat(path)
     missing = []
     if not creds.get("base_url"):
         missing.append("base_url")
     if not (creds.get("token") or (creds.get("username") and creds.get("password"))):
         missing.append("username+password（或 token）")
     if missing:
-        die(f"凭据文件 {path} 缺字段: {', '.join(missing)}")
+        die(f"凭据文件 {path} 缺字段: {', '.join(missing)}；可运行 {PROG} init 补齐。")
     timeout = 60
     if creds.get("timeout"):
         try:
             timeout = int(float(creds["timeout"]))
         except ValueError:
             print(f"[警告] timeout 值无法解析: {creds['timeout']}，改用默认 60", file=sys.stderr)
+    projects = [s.strip() for s in (creds.get("projects") or "").split(",") if s.strip()]
     return {
         "base": creds["base_url"].rstrip("/"),
         "user": creds.get("username", ""),
@@ -143,6 +187,9 @@ def load_creds(path):
         "token": creds.get("token", ""),
         "insecure": str(creds.get("insecure", "")).strip().lower() in ("1", "true", "yes", "on"),
         "timeout": timeout,
+        "projects": projects,
+        "active": (creds.get("active_project") or "").strip(),
+        "default_jql": (creds.get("default_jql") or "").strip(),
         "path": path,
     }
 
@@ -264,7 +311,32 @@ def _fmt_fields_csv(fields):
     return fields
 
 
+# ---------------- 项目上下文（活动项目） ----------------
+
+def _key_arg(raw):
+    """单号参数：纯数字时自动补当前活动项目前缀（如 25 → STRUCTURING-25）。"""
+    k = str(raw or "").strip()
+    if re.fullmatch(r"\d+", k):
+        act = (C.get("active") or "").strip()
+        if act:
+            return f"{act}-{k}"
+        die(f"「{k}」是纯数字：先设置活动项目（{PROG} use <项目>），或给完整单号（如 STRUCTURING-{k}）")
+    return k
+
+
+def _warn_project(key):
+    """操作的单不属于当前活动项目时给出提醒（不拦截）。"""
+    act = (C.get("active") or "").strip()
+    proj = key.split("-", 1)[0] if "-" in key else ""
+    if act and proj and proj.upper() != act.upper():
+        print(f"[提示] {key} 属于项目 {proj}，当前活动项目是 {act}"
+              f"（如需切换: {PROG} use {proj}）", file=sys.stderr)
+
+
 # ---------------- search ----------------
+
+DEFAULT_JQL = "project = {project} AND resolution = Unresolved AND assignee in (currentUser()) order by updated DESC"
+
 
 def _jql_from_url(u):
     q = urlparse(u).query
@@ -275,6 +347,24 @@ def _jql_from_url(u):
         die("URL 里没有 jql 参数。请用过滤器页地址（含 /issues/?jql=… 的链接）；"
             "browse 单页链接不含 JQL，不能直接当清单用。")
     return qs["jql"][0]
+
+
+def _build_default_jql(project):
+    """生成默认 JQL：project 为 ALL/*/全部 时不限定项目；可用配置 default_jql 覆盖模板（保留 {project} 占位符）。"""
+    tpl = C.get("default_jql") or DEFAULT_JQL
+    if project in ("ALL", "*", "全部"):
+        if "{project}" not in tpl:
+            return tpl
+        s = re.sub(r"project\s*=\s*\{project\}\s*AND\s+", "", tpl, count=1, flags=re.I)
+        if s == tpl:
+            s = re.sub(r"project\s*=\s*\{project\}", "", tpl, count=1, flags=re.I)
+        s = re.sub(r"^\s*AND\s+", "", s.strip(), flags=re.I).strip()
+        if "{project}" in s:
+            die("default_jql 里的 project 条件无法移除：改成「project = {project} AND …」形式，或显式 --jql")
+        return s
+    if "{project}" not in tpl:
+        die("配置的 default_jql 缺 {project} 占位符，无法套用当前项目；请显式 --jql 或修改配置（docs/01）")
+    return tpl.replace("{project}", project)
 
 
 def _fetch_issues(jql, fields, max_n, all_flag):
@@ -297,7 +387,22 @@ def _fetch_issues(jql, fields, max_n, all_flag):
 
 
 def cmd_search(args):
-    jql = args.jql or _jql_from_url(args.url)
+    if args.url:
+        jql = _jql_from_url(args.url)
+    elif args.jql:
+        jql = args.jql
+    else:
+        proj = (args.project or C.get("active") or "").strip()
+        if proj and proj.upper() not in ("ALL", "*", "全部"):
+            proj = proj.upper()
+        if not proj:
+            die(f"未给查询条件且未设置活动项目：先用 {PROG} use <项目> 设置（或 --jql/--url/--project 显式指定；"
+                f"--project ALL=不限项目）")
+        jql = _build_default_jql(proj)
+        label = "全部" if proj in ("ALL", "*", "全部") else proj
+        src = "指定项目" if args.project else "活动项目"
+        note = f"[项目] {src}: {label}；JQL: {jql}"
+        print(note, file=(sys.stderr if args.format == "json" else sys.stdout))
     issues, total = _fetch_issues(jql, _fmt_fields_csv(args.fields), args.max, args.all)
     rows = []
     for it in issues:
@@ -355,9 +460,11 @@ def cmd_search(args):
 # ---------------- issue ----------------
 
 def cmd_issue(args):
+    key = _key_arg(args.key)
+    _warn_project(key)
     fields = ("summary,description,status,priority,issuetype,assignee,reporter,"
               "created,updated,comment,resolution,attachment")
-    _, d = _request("GET", f"/rest/api/2/issue/{args.key}", params={"fields": fields})
+    _, d = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": fields})
     if args.format == "json":
         text = json.dumps(d, ensure_ascii=False, indent=1)
         if args.save:
@@ -401,7 +508,9 @@ def cmd_issue(args):
 # ---------------- transitions / start ----------------
 
 def cmd_transitions(args):
-    _, d = _request("GET", f"/rest/api/2/issue/{args.key}/transitions", params={"fields": "status"})
+    key = _key_arg(args.key)
+    _warn_project(key)
+    _, d = _request("GET", f"/rest/api/2/issue/{key}/transitions", params={"fields": "status"})
     for t in d.get("transitions", []):
         print(f"{t['id']}\t{t['name']}\t-> {t['to']['name']} (category={t['to'].get('statusCategory',{}).get('key','?')})")
     if not d.get("transitions"):
@@ -421,38 +530,57 @@ def _pick_transition(transitions, name_hint=None, to_category=None):
 
 
 def cmd_start(args):
-    _, d = _request("GET", f"/rest/api/2/issue/{args.key}/transitions")
+    key = _key_arg(args.key)
+    _warn_project(key)
+    _, d = _request("GET", f"/rest/api/2/issue/{key}/transitions")
     ts = d.get("transitions", [])
     if not ts:
-        die(f"当前账号对 {args.key} 无任何可用流转——常见原因：单子经办人不是你（工作流限制只有经办人能流转）或已到终态。"
-            f"如要接手处理，可先执行: {PROG} assign {args.key} --to me")
+        die(f"当前账号对 {key} 无任何可用流转——常见原因：单子经办人不是你（工作流限制只有经办人能流转）或已到终态。"
+            f"如要接手处理，可先执行: {PROG} assign {key} --to me")
+    _, sd = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "status"})
+    st = sd["fields"]["status"]
+    cur_name = st.get("name", "?")
+    cur_cat = (st.get("statusCategory") or {}).get("key", "")
     if args.transition_id:
         tid = next((t for t in ts if t["id"] == str(args.transition_id)), None)
         if not tid:
             die(f"transition id {args.transition_id} 不在可用列表: {[t['id'] for t in ts]}")
         pick = [tid]
     else:
-        pick = _pick_transition(ts, name_hint="接受") or _pick_transition(ts, to_category="indeterminate")
+        pick = _pick_transition(ts, name_hint="接受")
+        if not pick and cur_cat not in ("indeterminate", "done"):
+            working_like = [t for t in ts
+                            if any(k in _norm(t["to"].get("name", ""))
+                                   for k in ("working", "处理", "进行", "inprogress"))]
+            if len(working_like) == 1:
+                pick = working_like
+                print(f"[匹配] 按目标状态「{pick[0]['to']['name']}」选取流转（名称未含「接受」）", file=sys.stderr)
         if not pick:
-            die(f"找不到「接受」类流转，可用: {[(t['id'], t['name'], t['to']['name']) for t in ts]}")
+            if cur_cat in ("indeterminate", "done"):
+                die(f"当前状态「{cur_name}」已不是「未开始」，无需「接受」；可用流转: "
+                    f"{[(t['id'], t['name'], t['to']['name']) for t in ts]}（确要流转用 --transition-id 指定）")
+            die(f"找不到「接受」类流转（未开始→处理中），可用: "
+                f"{[(t['id'], t['name'], t['to']['name']) for t in ts]}；可 --transition-id 指定")
         if len(pick) > 1:
             die(f"「接受」类流转不唯一，请 --transition-id 指定: {[(t['id'], t['name']) for t in pick]}")
     tid = pick[0]
     payload = {"transition": {"id": tid["id"]}}
     if args.dry_run:
-        print(f"[DRY-RUN] 当前: {_status_line(args.key)}")
-        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{args.key}/transitions body: "
+        print(f"[DRY-RUN] 当前: {key} -> {cur_name}")
+        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/transitions body: "
               f"{json.dumps(payload, ensure_ascii=False)}（{tid['name']} -> {tid['to']['name']}）")
         print("（未发任何写请求；去掉 --dry-run 即执行）")
         return
-    _request("POST", f"/rest/api/2/issue/{args.key}/transitions", body=payload)
-    print(f"已流转: {tid['name']} -> {tid['to']['name']} @ {C['base']}；读回: {_status_line(args.key)}")
+    _request("POST", f"/rest/api/2/issue/{key}/transitions", body=payload)
+    print(f"已流转: {tid['name']} -> {tid['to']['name']} @ {C['base']}；读回: {_status_line(key)}")
 
 
 # ---------------- editmeta ----------------
 
 def cmd_editmeta(args):
-    _, d = _request("GET", f"/rest/api/2/issue/{args.key}/editmeta")
+    key = _key_arg(args.key)
+    _warn_project(key)
+    _, d = _request("GET", f"/rest/api/2/issue/{key}/editmeta")
     fields = d.get("fields", {})
     if not fields:
         print("（无任何可编辑字段）")
@@ -478,7 +606,8 @@ def _resolve_user(key, query):
 
 
 def cmd_assign(args):
-    key = args.key
+    key = _key_arg(args.key)
+    _warn_project(key)
     q = (args.to or "").strip()
     if not q:
         die("--to 不能为空（人员显示名/登录名，或 me 表示自己）")
@@ -504,6 +633,8 @@ def cmd_assign(args):
 
 
 def cmd_comment(args):
+    key = _key_arg(args.key)
+    _warn_project(key)
     if args.body_file:
         if not os.path.exists(args.body_file):
             die(f"文件不存在: {args.body_file}")
@@ -515,15 +646,15 @@ def cmd_comment(args):
         die("评论内容为空")
     payload = {"body": body}
     if args.dry_run:
-        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{args.key}/comment body: "
+        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/comment body: "
               f"{json.dumps(payload, ensure_ascii=False)}")
         print("（未发任何写请求；去掉 --dry-run 即执行）")
         return
-    _, d = _request("POST", f"/rest/api/2/issue/{args.key}/comment", body=payload)
+    _, d = _request("POST", f"/rest/api/2/issue/{key}/comment", body=payload)
     cid = d.get("id")
-    _, chk = _request("GET", f"/rest/api/2/issue/{args.key}/comment/{cid}")
+    _, chk = _request("GET", f"/rest/api/2/issue/{key}/comment/{cid}")
     ok = str(chk.get("id")) == str(cid)
-    print(f"已评论 {args.key} (comment id={cid}) @ {C['base']}；"
+    print(f"已评论 {key} (comment id={cid}) @ {C['base']}；"
           f"读回: id={chk.get('id')} by {(chk.get('author') or {}).get('displayName','-')} {'✓' if ok else '⚠'}")
 
 
@@ -532,6 +663,236 @@ def cmd_whoami(args):
     auth = "token" if C.get("token") else "basic"
     print(f"身份: {d.get('displayName')} (name={d.get('name')}, email={d.get('emailAddress', '-')})")
     print(f"实例: {C['base']}（凭据: {C['path']}，认证: {auth}）")
+    act = (C.get("active") or "").strip()
+    n = len(C.get("projects") or [])
+    if act:
+        print(f"当前活动项目: {act}（已登记 {n} 个项目；{PROG} use 切换）")
+    else:
+        print(f"当前活动项目: （未设置）→ {PROG} use <项目>（已登记 {n} 个）")
+
+
+# ---------------- 初始化 / 项目切换 ----------------
+
+def _prompt(label):
+    while True:
+        v = input(f"{label}: ").strip()
+        if v:
+            return v
+        print("（不能为空，请重试；Ctrl+C 可中止）")
+
+
+def _init_check(path):
+    global C
+    print(f"[检查] 配置文件: {path}")
+    if not os.path.exists(path):
+        print("  状态: 未初始化 ✗")
+        print(f"  下一步: python {PROG} init   （交互向导：账号 → 验证 → 登记项目 → 设活动项目）")
+        sys.exit(1)
+    creds = _read_flat(path)
+    missing = []
+    if not creds.get("base_url"):
+        missing.append("base_url")
+    if not (creds.get("token") or (creds.get("username") and creds.get("password"))):
+        missing.append("username+password（或 token）")
+    if missing:
+        print(f"  缺字段: {', '.join(missing)}")
+        print(f"  状态: 未初始化(不完整) ✗ → python {PROG} init")
+        sys.exit(1)
+    print(f"  实例: {creds.get('base_url')}")
+    print(f"  账号: {creds.get('username') or '(token 认证)'}")
+    C = load_creds(path)
+    try:
+        _, me = _request("GET", "/rest/api/2/myself")
+        print(f"  认证: OK（{me.get('displayName')}）")
+    except SystemExit:
+        print("  认证: 失败 ✗（检查账号密码/SSO；或重跑 init）")
+        sys.exit(1)
+    projects = [s.strip() for s in (creds.get("projects") or "").split(",") if s.strip()]
+    active = (creds.get("active_project") or "").strip()
+    print(f"  已登记项目({len(projects)}): {', '.join(projects) if projects else '（无）→ 运行 init 登记'}")
+    print(f"  当前活动项目: {active if active else '（未设置）→ ' + PROG + ' use <项目>'}")
+    print("  状态: 已初始化 ✓")
+
+
+def _init_projects(args, path):
+    _, d = _request("GET", "/rest/api/2/project")
+    allp = [(p.get("key", ""), p.get("name", "")) for p in d or []]
+    cur = [s.strip() for s in (_read_flat(path).get("projects") or "").split(",") if s.strip()]
+    picked = None
+    if args.projects is not None:
+        if args.projects.strip().lower() in ("all", "全部", "*"):
+            picked = [k for k, n in allp]
+        else:
+            picked = []
+            for w in [x.strip() for x in args.projects.split(",") if x.strip()]:
+                hits = [k for k, n in allp if k.upper() == w.upper()]
+                if not hits:
+                    near = [k for k, n in allp if w.upper() in k.upper()][:8]
+                    die(f"项目「{w}」在实例中不存在（相近: {near or '（无）'}）")
+                picked.append(hits[0])
+    elif sys.stdin.isatty():
+        print(f"[项目] 实例共 {len(allp)} 个可见项目:")
+        for i, (k, n) in enumerate(allp[:300], 1):
+            mark = " *" if k in cur else "  "
+            print(f"{mark} {i:>3}  {k:<18} {n}")
+        if len(allp) > 300:
+            print("    …（仅显示前 300，更多用 projects --query 查）")
+        print("    （* = 已登记；回车 = 保留现状）")
+        raw = input("选择要登记的项目（序号或KEY，逗号分隔）: ").strip()
+        if raw:
+            picked = []
+            for tok in re.split(r"[,\s，、]+", raw):
+                if not tok:
+                    continue
+                if tok.isdigit():
+                    i = int(tok) - 1
+                    if not (0 <= i < min(len(allp), 300)):
+                        die(f"序号 {tok} 超出范围（1-{min(len(allp), 300)}）")
+                    picked.append(allp[i][0])
+                else:
+                    hits = [k for k, n in allp if k.upper() == tok.upper()]
+                    if not hits:
+                        die(f"项目「{tok}」在实例中不存在")
+                    picked.append(hits[0])
+    elif not cur:
+        print("[提示] 非交互模式未登记项目：可用 --projects 'A,B' 登记，或 use <KEY> 自动登记")
+    if picked is not None:
+        seen = set()
+        keys = [p for p in picked if not (p in seen or seen.add(p))]
+        _update_cfg(path, {"projects": ",".join(keys)})
+        print(f"[保存] 已登记项目({len(keys)}): {', '.join(keys) if keys else '（空）'}")
+        final_list = keys
+    else:
+        final_list = cur
+    active = (_read_flat(path).get("active_project") or "").strip()
+    use_key = (args.use or "").strip()
+    if use_key:
+        hits = [p for p in final_list if p.upper() == use_key.upper()] or \
+               [k for k, n in allp if k.upper() == use_key.upper()]
+        if not hits:
+            die(f"--use 指定的项目「{use_key}」不存在或未登记")
+        target = hits[0]
+        ups = {"active_project": target}
+        if target not in final_list:
+            ups["projects"] = ",".join(final_list + [target])
+        _update_cfg(path, ups)
+        print(f"[保存] 当前活动项目: {target}")
+    elif not active and final_list:
+        target = final_list[0]
+        _update_cfg(path, {"active_project": target})
+        print(f"[保存] 当前活动项目: {target}（默认取第一个；{PROG} use 切换）")
+
+
+def cmd_init(args):
+    global C
+    path = resolve_creds_path(args, for_init=True)
+    if args.check:
+        _init_check(path)
+        return
+    interactive = sys.stdin.isatty()
+    creds = _read_flat(path) if os.path.exists(path) else {}
+    base = (args.base_url or creds.get("base_url") or "").strip()
+    user = (args.username or creds.get("username") or "").strip()
+    pw = args.password or creds.get("password") or ""
+    token = (args.token or creds.get("token") or "").strip()
+    print(f"[初始化] 配置文件: {path}")
+    if creds:
+        print(f"[初始化] 检测到现有配置（{creds.get('base_url', '?')}），将补齐/更新缺失项")
+    if not base:
+        if not interactive:
+            die("非交互模式须提供 --base-url（或已有 base_url）；交互模式直接运行 init 按提示输入")
+        base = _prompt("JIRA 地址（如 https://ticket.你的公司.com）")
+    if not token:
+        if not user:
+            if not interactive:
+                die("非交互模式须提供 --username（或已有）")
+            user = _prompt("登录名")
+        if not pw:
+            if not interactive:
+                die("非交互模式须提供 --password（或 --token）")
+            pw = getpass.getpass("密码（输入不回显）: ").strip()
+            if not pw:
+                die("密码为空，已中止")
+    updates = {"base_url": base.rstrip("/")}
+    if user:
+        updates["username"] = user
+    if pw:
+        updates["password"] = pw
+    if token:
+        updates["token"] = token
+    _update_cfg(path, updates)
+    C = load_creds(path)
+    if getattr(args, "timeout", None):
+        C["timeout"] = args.timeout
+    if getattr(args, "insecure", False):
+        C["insecure"] = True
+    print(f"[保存] 配置已写入: {path}")
+    _, me = _request("GET", "/rest/api/2/myself")
+    print(f"[验证] 身份: {me.get('displayName')} (name={me.get('name')}) @ {C['base']}")
+    _init_projects(args, path)
+    cfg = _read_flat(path)
+    projects = [s.strip() for s in (cfg.get("projects") or "").split(",") if s.strip()]
+    active = (cfg.get("active_project") or "").strip()
+    print(f"[完成] 已登记项目({len(projects)}): {', '.join(projects) if projects else '（无）'}")
+    if active:
+        print(f"[完成] 当前活动项目: {active}（不切换就一直用它；{PROG} use 切换）")
+        print(f"[完成] 试试: python {PROG} search   ← 当前项目里我的未解决 bug")
+    else:
+        print(f"[完成] 当前活动项目: （未设置）→ {PROG} use <项目>")
+    print(f"[完成] 体检: python {PROG} init --check")
+
+
+def _resolve_project_arg(arg, projects):
+    a = arg.strip()
+    if a.isdigit():
+        i = int(a) - 1
+        if 0 <= i < len(projects):
+            return projects[i]
+        die(f"序号 {a} 超出范围（已登记 {len(projects)} 个；{PROG} use 查看列表）")
+    hits = [p for p in projects if p.upper() == a.upper()]
+    if hits:
+        return hits[0]
+    hits = [p for p in projects if a.upper() in p.upper()]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        die(f"「{arg}」匹配多个已登记项目: {hits}；请给完整 KEY")
+    _, d = _request("GET", "/rest/api/2/project")
+    allp = [(p.get("key", ""), p.get("name", "")) for p in d or []]
+    exact = [k for k, n in allp if k.upper() == a.upper()]
+    if exact:
+        return exact[0]
+    near = [k for k, n in allp if a.upper() in k.upper() or a.upper() in (n or "").upper()][:8]
+    die(f"项目「{arg}」不在已登记列表、实例里也没有。相近的: {near or '（无）'}\n"
+        f"（全量查看: {PROG} projects [--query 关键词]）")
+
+
+def cmd_use(args):
+    act = (C.get("active") or "").strip()
+    projects = C.get("projects") or []
+    tgt = (getattr(args, "target", None) or "").strip()
+    if not tgt:
+        print(f"当前活动项目: {act or '（未设置）'}")
+        if not projects:
+            print(f"已登记项目: （无）—— 用 {PROG} init 登记，或直接 {PROG} use <项目KEY>（会自动校验并登记）")
+            return
+        print("已登记项目（use 序号或KEY 切换）:")
+        for i, p in enumerate(projects, 1):
+            mark = "*" if act and p.upper() == act.upper() else " "
+            print(f"  {mark} {i:>2}  {p}")
+        return
+    key = _resolve_project_arg(tgt, projects)
+    is_new = key not in projects
+    ups = {"active_project": key}
+    if is_new:
+        ups["projects"] = ",".join(projects + [key])
+    _update_cfg(C["path"], ups)
+    C["active"] = key
+    if is_new:
+        C["projects"] = projects + [key]
+    tail = f"（新登记，共 {len(C['projects'])} 个）" if is_new else ""
+    print(f"已切换当前活动项目: {key} {tail}".rstrip())
+    print("之后不带 --jql/--url/--project 的 search 默认只查它；其他项目的单会给出提示（--project KEY 可临时换）。")
 
 
 # ---------------- 探查 / 附件 ----------------
@@ -565,7 +926,9 @@ def cmd_fields(args):
 
 
 def cmd_attachments(args):
-    _, d = _request("GET", f"/rest/api/2/issue/{args.key}", params={"fields": "attachment"})
+    key = _key_arg(args.key)
+    _warn_project(key)
+    _, d = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "attachment"})
     atts = (d.get("fields") or {}).get("attachment") or []
     if not atts:
         print("（该单无附件）")
@@ -575,7 +938,7 @@ def cmd_attachments(args):
         if not atts2:
             die(f"未找到附件 id={args.id}（可用: {[(a.get('id'), a.get('filename')) for a in atts]}）")
         atts = atts2
-    save_dir = args.save_dir or os.path.join("jira-attachments", args.key)
+    save_dir = args.save_dir or os.path.join("jira-attachments", key)
     os.makedirs(save_dir, exist_ok=True)
     for a in atts:
         name = _safe_name(a.get("filename") or f"attachment-{a.get('id')}")
@@ -609,7 +972,8 @@ def _wrap_value(meta, fid, raw):
 
 
 def cmd_resolve(args):
-    key = args.key
+    key = _key_arg(args.key)
+    _warn_project(key)
     # 1) 找「解决」流转，并带 transitions.fields 展开（transition screen 字段在此）
     _, d = _request("GET", f"/rest/api/2/issue/{key}/transitions",
                     params={"expand": "transitions.fields"})
@@ -755,7 +1119,7 @@ def main():
         pass
     p = argparse.ArgumentParser(
         prog=PROG,
-        description=f"JIRA REST CLI（纯数据流，v{VERSION}）—— 拉单/读单/流转/指派/评论，全部走 REST API，零浏览器。")
+        description=f"JIRA REST CLI（纯数据流，v{VERSION}）—— 初始化/拉单/读单/流转/指派/评论，全部走 REST API，零浏览器。")
     p.add_argument("--version", action="version", version=f"{PROG} {VERSION}")
     p.add_argument("--config", metavar="PATH", help=f"凭据文件路径（默认 {_default_creds_path()}）")
     p.add_argument("--profile", metavar="NAME", help=f"凭据 profile 名（读 {_profiles_dir()}/NAME.yaml；多实例/多账号）")
@@ -763,10 +1127,25 @@ def main():
     p.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验（默认失败后自动降级重试）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("search", help="JQL 搜索 bug 清单（超 100 自动分页）")
-    g = s.add_mutually_exclusive_group(required=True)
+    ini = sub.add_parser("init", help="初始化向导：配置账号 → 验证 → 登记项目 → 设活动项目（--check 只体检）")
+    ini.add_argument("--check", action="store_true", help="只检查当前配置状态（返回码 0=已就绪），不做任何修改")
+    ini.add_argument("--base-url", help="JIRA 地址（非交互模式必填，除非配置里已有）")
+    ini.add_argument("--username", help="登录名")
+    ini.add_argument("--password", help="密码（交互模式下建议不传此参数，改用提示输入且不回显）")
+    ini.add_argument("--token", help="Bearer token（Server PAT；与密码二选一）")
+    ini.add_argument("--projects", help="登记的项目 KEY，逗号分隔（或 all=全部）")
+    ini.add_argument("--use", help="顺便把活动项目设为该 KEY")
+    ini.set_defaults(fn=cmd_init)
+
+    us = sub.add_parser("use", help="查看/切换当前活动项目（不带参数=查看列表）")
+    us.add_argument("target", nargs="?", help="项目 KEY（或列表里的序号；支持前缀模糊匹配）")
+    us.set_defaults(fn=cmd_use)
+
+    s = sub.add_parser("search", help="JQL 搜索 bug 清单（超 100 自动分页；不传条件=当前活动项目我的未解决）")
+    g = s.add_mutually_exclusive_group()
     g.add_argument("--jql", help="原始 JQL，如 'project = X AND resolution = Unresolved'")
     g.add_argument("--url", help="过滤器链接（自动提取 jql 参数），如 https://主机/issues/?jql=…")
+    g.add_argument("--project", metavar="KEY", help="本次只查该项目（ALL=不限项目；不改活动项目）")
     s.add_argument("--max", type=int, default=100, help="最多取多少张（默认 100）")
     s.add_argument("--all", action="store_true", help="取全部（忽略 --max）")
     s.add_argument("--format", choices=["table", "json", "md"], default="table")
@@ -774,7 +1153,7 @@ def main():
                    help="逗号分隔字段列表")
     s.set_defaults(fn=cmd_search)
 
-    i = sub.add_parser("issue", help="拉单详情+评论+附件")
+    i = sub.add_parser("issue", help="拉单详情+评论+附件（单号可只写数字=当前活动项目）")
     i.add_argument("key")
     i.add_argument("--save", help="保存到文件（推荐 AI 阅读）")
     i.add_argument("--format", choices=["md", "json"], default="md")
@@ -821,7 +1200,7 @@ def main():
     cm.add_argument("--dry-run", action="store_true", help="只预演不提交")
     cm.set_defaults(fn=cmd_comment)
 
-    w = sub.add_parser("whoami", help="当前登录身份/实例（冒烟验证首选）")
+    w = sub.add_parser("whoami", help="当前登录身份/实例/活动项目（冒烟验证首选）")
     w.set_defaults(fn=cmd_whoami)
 
     pr = sub.add_parser("projects", help="列出可见项目（接入新实例先跑它）")
@@ -839,6 +1218,10 @@ def main():
     at.set_defaults(fn=cmd_attachments)
 
     args = p.parse_args()
+    if args.cmd == "init":
+        # init 自行处理配置的加载/创建（首次运行时文件还不存在）
+        args.fn(args)
+        return
     path = resolve_creds_path(args)
     C = load_creds(path)
     if args.timeout:

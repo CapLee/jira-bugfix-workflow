@@ -15,17 +15,22 @@ version: 2.0.0
 - 用户要求「不要浏览器 / 不要模拟点击 / 纯数据流」
 - 用户要帮改**别人名下的单**、切换**多个 JIRA 实例/账号**（v2 能力）
 
-## 一次性配置
+## 首次使用：先初始化
 
-- 凭据文件（flat yaml：base_url / username / password，可选 token/insecure/timeout），默认 `%LOCALAPPDATA%\hermes\jira-api-creds.yaml`（macOS/Linux `~/hermes/…`）
-- 多实例：`hermes/jira-profiles/<名字>.yaml` + `--profile <名字>`（报错会列可用名字）
-- 冒烟：`python3 scripts/jira.py whoami`（身份+实例一行看清）
+- `python3 scripts/jira.py init --check` → 自查（返回码 0=已就绪）；未就绪跑 `init` 向导（账号 → 现场验证 → 勾选登记项目 → 设活动项目）
+- 凭据文件（flat yaml：base_url / username / password，可选 token / insecure / timeout / projects / active_project / default_jql），默认 `%LOCALAPPDATA%\hermes\jira-api-creds.yaml`（macOS/Linux `~/hermes/…`）；多实例：`hermes/jira-profiles/<名字>.yaml` + `--profile <名字>`
+- **活动项目**：`use` 查看/切换；不带条件的 search、纯数字单号都聚焦当前活动项目
+- 冒烟：`python3 scripts/jira.py whoami`（身份+实例+活动项目一行看清）
 
 ## 命令速查（全部 `--help` 可用）
 
 ```
-whoami                                   # 身份/实例（冒烟首选）
+init [--check]                           # 初始化向导 / 体检（首次必跑）
+use [KEY]                                # 查看/切换当前活动项目
+whoami                                   # 身份/实例/活动项目（冒烟首选）
+search                                   # 不传条件 = 当前活动项目我的未解决
 search --jql '…' [--max|--all] [--format table|json|md]   # 拉清单，自动分页
+search --project KEY                     # 临时只看某项目（ALL=不限）
 search --url '…/issues/?jql=…'           # 贴过滤器链接
 issue KEY [--save f.md]                  # 详情+评论+附件
 attachments KEY [--save-dir 目录]         # 下载附件（截图）
@@ -40,7 +45,7 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 
 ## 标准流程（六步）
 
-1. `search` 拉清单 → **编号呈现给用户**，等圈单（每轮 ≤5 张）
+1. `search` 拉清单（不传条件=当前活动项目；`use` 切换）→ **编号呈现给用户**，等圈单（每轮 ≤5 张）
 2. `issue KEY` 逐张读详情+评论（需要时 `attachments` 下截图）
 3. 用户确认后改码 + 自验证（改动只留工作区，**不 git commit**；涉及表/数据交付 DDL/DML）
 4. `start KEY` 接受（读回验证）
@@ -66,6 +71,8 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 | 现象 | 处理 |
 |---|---|
 | 401/403 | 凭据/SSO；视环境降级浏览器方案 |
+| 未初始化 / 未设活动项目 | `init` 向导 / `use <项目>`；`init --check` 自查 |
+| 当前状态已不是「未开始」 | start 安全护栏：单已处理中；确要流转用 `--transition-id` |
 | `当前账号对 X 无任何可用流转` | 不是你的单 → `assign X --to me` |
 | 无「接受/解决」类流转或歧义 | `transitions KEY` 看候选 → `--transition-id` |
 | 必填未填 | `--dry-run` 看屏幕字段清单 → `--field '标签=值'` |
