@@ -644,17 +644,40 @@ def cmd_editmeta(args):
 # ---------------- 人员 / 协作 ----------------
 
 def _resolve_user(key, query):
+    """解析目标用户（assign / resolve --assign 共用）。
+
+    注意：部分 JIRA 实例会忽略 search 的 query 参数、直接返回全量 assignable 列表
+    （本实例实测如此），且默认 20 条会截断名单——因此拉全量后在客户端按
+    显示名/登录名二次过滤，不能信任服务端检索与排序。
+    匹配规则：精确（显示名或登录名完全一致）> 归一化子串唯一命中；多候选列出并中止。
+    """
     _, users = _request("GET", "/rest/api/2/user/assignable/search",
-                        params={"issueKey": key, "query": query, "maxResults": 20})
-    exact = [u for u in users if u.get("displayName") == query or u.get("name") == query]
-    cand = exact or users
-    if not cand:
-        die(f"未找到可指派人匹配「{query}」（该人不属于本项目 assignable 用户？换登录名/显示名再试）")
-    target = cand[0]
-    if len(cand) > 1 and not exact:
-        print(f"[警告] 匹配到多个用户，取第一个 {target.get('displayName')}："
-              f"{[u.get('displayName') for u in users]}", file=sys.stderr)
-    return target
+                        params={"issueKey": key, "query": query, "maxResults": 200})
+    q_raw = (query or "").strip()
+    q_norm, q_low = _norm(q_raw), q_raw.lower()
+
+    def _exact(u):
+        return (u.get("displayName") or "").strip() == q_raw \
+            or (u.get("name") or "").strip().lower() == q_low
+
+    def _partial(u):
+        dn = _norm(u.get("displayName") or "")
+        nm = (u.get("name") or "").lower()
+        return (bool(q_norm) and q_norm in dn) or (bool(q_low) and q_low in nm)
+
+    picked = [u for u in users if _exact(u)] or [u for u in users if _partial(u)]
+    if not picked:
+        die(f"未找到可指派人匹配「{q_raw}」（该人不属于本项目 assignable 用户？换登录名/显示名再试）")
+    seen, cand = set(), []  # 按登录名去重，保持服务端顺序
+    for u in picked:
+        k = u.get("name") or u.get("displayName")
+        if k not in seen:
+            seen.add(k)
+            cand.append(u)
+    if len(cand) > 1:
+        die(f"「{q_raw}」匹配到多个可指派人，请用完整显示名或登录名精确指定: "
+            + "；".join(f"{u.get('displayName')} (name={u.get('name')})" for u in cand))
+    return cand[0]
 
 
 def cmd_assign(args):

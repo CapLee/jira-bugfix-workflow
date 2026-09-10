@@ -1,7 +1,7 @@
 ---
 name: jira-bugfix-workflow
 description: Use when 用纯数据流（REST API）处理 JIRA bug——拉单/读单/改码/接受/解决，含改别人的单、多实例切换。不要浏览器点击时。
-version: 2.0.0
+version: 2.2.0
 ---
 
 # JIRA Bug 纯数据流处理（jira.py）
@@ -78,6 +78,7 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 | 当前状态已不是「未开始」 | start 安全护栏：单已处理中；确要流转用 `--transition-id` |
 | `当前账号对 X 无任何可用流转` | 不是你的单 → `assign X --to me` |
 | JQL 里 `status = 未开始` 静默返 0 | 本实例用内部名：`status = "Initial"`（=未开始；保留字须加引号） |
+| 指派时提示「匹配到多个可指派人」 | 部分实例忽略查询词返回全量名单→脚本已客户端过滤；用完整显示名或完整登录名重试（不会乱指派） |
 | 无「接受/解决」类流转或歧义 | `transitions KEY` 看候选 → `--transition-id` |
 | 必填未填 | `--dry-run` 看屏幕字段清单 → `--field '标签=值'` |
 | 贴 browse 链接报无 jql | 改用 `/issues/?jql=` 过滤器链接 |

@@ -43,6 +43,7 @@
 | `凭据文件不存在` / `缺字段` | 路径或三键不全；`export JIRA_CREDS_PATH=…` 或 `--profile` 指定 |
 | `找不到 profile「xx」` | 按报错里列出的可用名字创建 `profiles/xx.yaml`（文件名必须=名字） |
 | `当前账号对 X 无任何可用流转` | 单子经办人不是你（工作流限制）→ `assign X --to me` 接管；或请原经办人转给你 |
+| `匹配到多个可指派人`（中止） | 部分实例忽略查询词、返回全量名单→脚本已客户端过滤；用完整显示名或完整登录名重试 |
 | `未初始化` / 缺字段 | 跑 `python3 jira.py init`（向导）；自查 `init --check` |
 | `未设置活动项目` | `python3 jira.py use <项目>` 设置；或 --jql/--url/--project 显式指定 |
 | `该查询未限定项目…被拦截` | 护栏：手写 JQL/链接没带 project；补 `project = X`，或用户确认跨项目后加 `--all-projects` |

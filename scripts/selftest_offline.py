@@ -131,7 +131,10 @@ class H(BaseHTTPRequestHandler):
             if path == "/rest/api/2/issue/T-1/comment/9001":
                 return self._json(200, {"id": "9001", "body": "hello", "author": {"displayName": "测试员甲"}})
             if path == "/rest/api/2/user/assignable/search":
-                return self._json(200, [{"name": "target1", "displayName": "目标人乙"}])
+                # 模拟本实例行为：忽略 query 参数、返回全量列表（匹配交由客户端过滤）
+                return self._json(200, [{"name": "admin", "displayName": "admin"},
+                                        {"name": "target1", "displayName": "目标人乙"},
+                                        {"name": "target2", "displayName": "目标人丙"}])
             if path == "/rest/api/2/project":
                 return self._json(200, [{"id": "1", "key": "T", "name": "测试项目"},
                                         {"id": "2", "key": "STRUCTURING", "name": "结构化文档"},
@@ -170,7 +173,8 @@ class H(BaseHTTPRequestHandler):
         state["puts"].append((path, body))
         if path == "/rest/api/2/issue/T-1/assignee":
             name = json.loads(body)["name"]
-            state["assignee"] = {"name": name, "displayName": "测试员甲" if name == "tester" else "目标人乙"}
+            dn = {"tester": "测试员甲", "target1": "目标人乙", "target2": "目标人丙"}.get(name, name)
+            state["assignee"] = {"name": name, "displayName": dn}
             return self._empty(204)
         return self._json(404, {"errorMessages": ["mock 未实现"]})
 
@@ -313,6 +317,19 @@ check("16 assign dry-run", r.returncode == 0 and "[DRY-RUN]" in r.stdout and len
 
 r = run(["--config", creds_basic, "assign", "T-1", "--to", "目标人乙"])
 check("17 assign real", r.returncode == 0 and "读回: 目标人乙 ✓" in r.stdout, r.stdout + r.stderr)
+
+r = run(["--config", creds_basic, "assign", "T-1", "--to", "丙", "--dry-run"])
+check("17b assign client-side partial", r.returncode == 0 and "目标人丙" in r.stdout and "target2" in r.stdout,
+      r.stdout + r.stderr)
+
+r = run(["--config", creds_basic, "assign", "T-1", "--to", "target2", "--dry-run"])
+check("17c assign by login name", r.returncode == 0 and "目标人丙" in r.stdout, r.stdout + r.stderr)
+
+puts1 = len(state["puts"])
+r = run(["--config", creds_basic, "assign", "T-1", "--to", "目标", "--dry-run"])
+check("17d assign ambiguous die", r.returncode == 1 and "匹配到多个可指派人" in r.stderr
+      and "目标人乙" in r.stderr and "目标人丙" in r.stderr and len(state["puts"]) == puts1,
+      r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "comment", "T-1", "--body", "hello"])
 check("18 comment real", r.returncode == 0 and "读回: id=9001" in r.stdout, r.stdout + r.stderr)

@@ -129,7 +129,7 @@ $ python3 jira.py resolve X-3 --impact "…" --cause "需求理解偏差" --solu
 ## 开发者自测（改完 jira.py 跑一遍）
 
 ```bash
-python3 scripts/selftest_offline.py    # 离线 mock：54 项断言，零真实请求，退出码 0 = 全过
+python3 scripts/selftest_offline.py    # 离线 mock：57 项断言，零真实请求，退出码 0 = 全过
 ```
 
 ## License
