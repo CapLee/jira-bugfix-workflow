@@ -7,12 +7,14 @@
 覆盖: 认证(Basic/Bearer)、profile、init 初始化向导、use 活动项目切换、
       --url 解析、自动分页、429/5xx 重试、dry-run 零写入、resolve 读回校验、
       assign/comment/attachments、纯数字单号、跨项目提示、各类错误路径、
-      项目文件夹配置（就近发现、优先级、pconfig --here）。
+      项目文件夹配置（就近发现、优先级、pconfig --here）、
+      changelog / create 建单 / 附件（列表/上传）（v2.4）。
       改完 jira.py 跑一遍。
 """
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,7 +29,8 @@ os.makedirs(PROJCFG, exist_ok=True)
 
 PORT = 0
 state = {"requests": [], "fail_search": 0, "assignee": {"name": "tester", "displayName": "测试员甲"},
-         "posts": [], "puts": []}
+         "posts": [], "puts": [], "uploaded_atts": [], "created_body": {},
+         "created_assignee": None, "last_upload_headers": {}}
 
 
 class H(BaseHTTPRequestHandler):
@@ -122,11 +125,55 @@ class H(BaseHTTPRequestHandler):
                     "comment": {"comments": [{"author": {"displayName": "测试员甲"},
                                               "created": "2026-09-02", "body": "复测未通过"}]},
                     "attachment": [{"id": "55", "filename": "shot.png", "size": 1234,
-                                    "content": f"http://127.0.0.1:{PORT}/att/1/shot.png"}],
+                                    "content": f"http://127.0.0.1:{PORT}/att/1/shot.png",
+                                    "author": {"displayName": "测试员甲"},
+                                    "created": "2026-09-03T09:00:00.000+0800"}]
+                                  + state["uploaded_atts"],
                     "customfield_13209": "范围X", "customfield_15817": {"value": "需求理解偏差"},
                     "customfield_15818": {"value": "调整UI/样式"}, "customfield_15819": {"value": "无需额外措施"},
                 }
-                return self._json(200, {"key": k, "fields": fields})
+                resp = {"key": k, "fields": fields}
+                if "changelog" in (qs.get("expand") or [""])[0]:
+                    resp["changelog"] = {"total": 2, "histories": [
+                        {"id": "h1", "author": {"displayName": "测试员甲"},
+                         "created": "2026-09-02T10:00:00.000+0800",
+                         "items": [{"field": "status", "fromString": "未开始", "toString": "Working"}]},
+                        {"id": "h2", "author": {"displayName": "测试员乙"},
+                         "created": "2026-09-05T11:30:00.000+0800",
+                         "items": [{"field": "assignee", "fromString": "", "toString": "李一鸣"},
+                                   {"field": "优先级", "fromString": "P3-次要", "toString": "P2-一般"}]}]}
+                return self._json(200, resp)
+            if path == "/rest/api/2/issue/createmeta":
+                pk = (qs.get("projectKeys") or ["?"])[0]
+                return self._json(200, {"projects": [{"key": pk, "name": "测试项目", "issuetypes": [
+                    {"id": "1", "name": "BUG", "fields": {
+                        "summary": {"name": "Summary", "required": True, "schema": {"type": "string"}},
+                        "description": {"name": "Description", "required": False, "schema": {"type": "string"}},
+                        "priority": {"name": "优先级", "required": False, "schema": {"type": "priority"},
+                                     "allowedValues": [{"id": "3", "name": "P2-一般"},
+                                                       {"id": "4", "name": "P3-次要"}]},
+                        "issuetype": {"name": "Issue Type", "required": True, "schema": {"type": "issuetype"}},
+                        "project": {"name": "Project", "required": True, "schema": {"type": "project"}},
+                        "customfield_13209": {"name": "影响范围", "required": True, "schema": {"type": "textarea"}},
+                        "customfield_15817": {"name": "发生原因", "required": False, "schema": {"type": "option"},
+                                              "allowedValues": [{"id": "1", "value": "需求理解偏差"}]}}},
+                    {"id": "2", "name": "TASK", "fields": {
+                        "summary": {"name": "Summary", "required": True, "schema": {"type": "string"}}}},
+                ]}]})
+            if path == "/rest/api/2/issue/T-999":
+                cb = state["created_body"] or {}
+                fields = {"status": {"name": "未开始", "statusCategory": {"key": "new"}},
+                          "resolution": None, "summary": cb.get("summary", ""),
+                          "description": cb.get("description", ""),
+                          "issuetype": {"name": (cb.get("issuetype") or {}).get("name", "BUG")},
+                          "assignee": state["created_assignee"],
+                          "created": "2026-09-28T09:00:00.000+0800"}
+                if "priority" in cb:
+                    fields["priority"] = cb["priority"]
+                for k2, v2 in cb.items():
+                    if k2.startswith("customfield_"):
+                        fields[k2] = v2
+                return self._json(200, {"key": "T-999", "fields": fields})
             if path == "/rest/api/2/issue/NOKEY":
                 return self._json(404, {"errorMessages": ["Issue does not exist or you do not have permission to see it."]})
             if path == "/rest/api/2/issue/T-1/comment/9001":
@@ -160,22 +207,39 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        body = self._body()
-        state["posts"].append((path, body))
+        ln = int(self.headers.get("Content-Length", 0) or 0)
+        rawb = self.rfile.read(ln) if ln else b""
+        state["posts"].append((path, rawb.decode("utf-8", "replace")))
+        if path.endswith("/attachments") and path.startswith("/rest/api/2/issue/"):
+            m = re.search(rb'filename="([^"]*)"', rawb)
+            fname = m.group(1).decode("utf-8", "replace") if m else "unknown"
+            state["last_upload_headers"] = dict(self.headers)
+            att = {"id": "77", "filename": fname, "size": ln,
+                   "author": {"displayName": "测试员甲"},
+                   "created": "2026-09-28T10:00:00.000+0800",
+                   "content": f"http://127.0.0.1:{PORT}/att/77/{fname}"}
+            state["uploaded_atts"].append(att)
+            return self._json(200, [att])
+        body = rawb.decode("utf-8", "replace")
         if path == "/rest/api/2/issue/T-1/transitions":
             return self._empty(204)
         if path == "/rest/api/2/issue/T-1/comment":
             return self._json(201, {"id": "9001", "body": "hello", "author": {"displayName": "测试员甲"}})
+        if path == "/rest/api/2/issue":
+            state["created_body"] = (json.loads(body).get("fields") or {})
+            return self._json(201, {"id": "888", "key": "T-999"})
         return self._json(404, {"errorMessages": ["mock 未实现"]})
 
     def do_PUT(self):
         path = urlparse(self.path).path
         body = self._body()
         state["puts"].append((path, body))
-        if path == "/rest/api/2/issue/T-1/assignee":
+        if path in ("/rest/api/2/issue/T-1/assignee", "/rest/api/2/issue/T-999/assignee"):
             name = json.loads(body)["name"]
             dn = {"tester": "测试员甲", "target1": "目标人乙", "target2": "目标人丙"}.get(name, name)
             state["assignee"] = {"name": name, "displayName": dn}
+            if "T-999" in path:
+                state["created_assignee"] = {"name": name, "displayName": dn}
             return self._empty(204)
         return self._json(404, {"errorMessages": ["mock 未实现"]})
 
@@ -234,7 +298,7 @@ with open(os.path.join(profdir, "token-inst.yaml"), "w", encoding="utf-8") as fp
     fp.write(f"base_url: {BASE}\ntoken: SECRET123\ntimeout: 30\ninsecure: true\n")
 
 r = run(["--version"])
-check("01 version", r.returncode == 0 and "2.3.0" in r.stdout, r.stdout + r.stderr)
+check("01 version", r.returncode == 0 and "2.4.0" in r.stdout, r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "whoami"])
 last_auth = state["requests"][-1][2]
@@ -583,6 +647,85 @@ paths = [x[1] for x in state["requests"]]
 check("55 bare number uses folder project",
       r.returncode == 0 and any("/rest/api/2/issue/T-1" in p for p in paths),
       f"rc={r.returncode} paths={paths}\n{r.stdout}{r.stderr}")
+
+# ---------- v2.4: changelog / create / 附件列表与上传 ----------
+
+r = run(["--config", creds_basic, "changelog", "T-1"])
+ok = (r.returncode == 0 and "变更历史（2 条）" in r.stdout and "测试员甲" in r.stdout
+      and "未开始" in r.stdout and "Working" in r.stdout and "优先级" in r.stdout
+      and "P3-次要 -> P2-一般" in r.stdout)
+check("56 changelog", ok, f"rc={r.returncode}\n{r.stdout}\n{r.stderr}")
+
+r = run(["--config", creds_basic, "changelog", "T-1", "--format", "json"])
+try:
+    j = json.loads(r.stdout)
+    ok = j.get("total") == 2 and len(j.get("histories", [])) == 2
+except Exception as e:
+    ok = False
+    j = str(e)
+check("57 changelog json", r.returncode == 0 and ok, f"{r.stdout} {r.stderr}")
+
+state["requests"].clear()
+r = run(["--config", creds_basic, "attachments", "T-1", "--list"])
+paths = [x[1] for x in state["requests"]]
+ok = (r.returncode == 0 and "shot.png" in r.stdout and "共 1 个附件" in r.stdout
+      and not any("/att/" in p for p in paths))
+check("58 attachments list (no download)", ok, f"rc={r.returncode} paths={paths}\n{r.stdout}{r.stderr}")
+
+upf = os.path.join(BASE_TMP, "upload-me.txt")
+with open(upf, "w", encoding="utf-8") as fp:
+    fp.write("upload test content")
+posts0 = len(state["posts"])
+r = run(["--config", creds_basic, "attachments", "T-1", "--upload", upf, "--dry-run"])
+check("59 upload dry-run no-write",
+      r.returncode == 0 and "[DRY-RUN]" in r.stdout and len(state["posts"]) == posts0,
+      f"rc={r.returncode} posts {posts0}->{len(state['posts'])}\n{r.stdout}{r.stderr}")
+
+r = run(["--config", creds_basic, "attachments", "T-1", "--upload", upf, "--comment", "附件说明"])
+rawp = next((b for p, b in reversed(state["posts"]) if p.endswith("/attachments")), "")
+hdrs = state.get("last_upload_headers") or {}
+ok = (r.returncode == 0 and "已上传: upload-me.txt" in r.stdout and "读回附件" in r.stdout
+      and "✓" in r.stdout and "comment id=9001" in r.stdout
+      and "upload-me.txt" in rawp and hdrs.get("X-Atlassian-Token") == "no-check")
+check("60 upload real (+comment, readback)", ok,
+      f"rc={r.returncode}\n{r.stdout}\n{r.stderr}\nraw_head={rawp[:200]}\n{hdrs}")
+
+r = run(["--config", creds_basic, "attachments", "T-1", "--upload",
+         os.path.join(BASE_TMP, "nope.bin")])
+check("61 upload missing file", r.returncode == 1 and "文件不存在" in r.stderr, r.stdout + r.stderr)
+
+posts0 = len(state["posts"])
+r = run(["--config", creds_basic, "create", "--project", "T", "--type", "BUG", "--summary", "smoke",
+         "--field", "影响范围=范围X", "--dry-run"])
+ok = (r.returncode == 0 and "[DRY-RUN]" in r.stdout and "customfield_13209" in r.stdout
+      and len(state["posts"]) == posts0)
+check("62 create dry-run no-write", ok, f"rc={r.returncode}\n{r.stdout}\n{r.stderr}")
+
+r = run(["--config", creds_basic, "create", "--project", "T", "--type", "BUG", "--summary", "smoke", "--dry-run"])
+check("63 create required die",
+      r.returncode == 1 and "必填字段未填" in r.stderr and "影响范围" in r.stderr, r.stdout + r.stderr)
+
+r = run(["--config", creds_basic, "create", "--project", "T", "--type", "NOPE", "--summary", "x", "--dry-run"])
+check("64 create bad type die", r.returncode == 1 and "不可用" in r.stderr and "TASK" in r.stderr,
+      r.stdout + r.stderr)
+
+state["posts"].clear()
+r = run(["--config", creds_basic, "create", "--project", "T", "--type", "BUG", "--summary", "新bug",
+         "--description", "描述X", "--priority", "P2-一般", "--field", "影响范围=范围X"])
+cb = json.loads(next((b for p, b in state["posts"] if p == "/rest/api/2/issue"), "{}"))
+ok = (r.returncode == 0 and "已创建 T-999" in r.stdout and "[校验]" in r.stdout
+      and cb.get("fields", {}).get("project") == {"key": "T"}
+      and cb["fields"]["issuetype"] == {"id": "1"}
+      and cb["fields"]["summary"] == "新bug" and cb["fields"]["description"] == "描述X"
+      and cb["fields"]["priority"] == {"id": "3"}
+      and cb["fields"]["customfield_13209"] == "范围X")
+check("65 create real", ok, f"rc={r.returncode} cb={cb}\n{r.stdout}\n{r.stderr}")
+
+r = run(["--config", creds_basic, "create", "--project", "T", "--type", "BUG", "--summary", "带指派",
+         "--field", "影响范围=范围X", "--assign", "目标人乙"])
+ok = (r.returncode == 0 and "已创建 T-999" in r.stdout
+      and "已转交经办人: 目标人乙 (name=target1) ✓" in r.stdout)
+check("66 create + assign", ok, f"rc={r.returncode}\n{r.stdout}\n{r.stderr}")
 
 failed = [n for n, ok in results if not ok]
 print(f"\n===== {len(results) - len(failed)}/{len(results)} PASS =====")

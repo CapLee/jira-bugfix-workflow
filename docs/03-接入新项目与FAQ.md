@@ -11,6 +11,8 @@
 | 字段 id / 类型 | `GET /rest/api/2/field` | `fields [--query]` |
 | 可用状态流转 | `GET /rest/api/2/issue/{KEY}/transitions` | 按名称匹配「接受」「解决」（中文名优先，兼容英文/目标状态名）；歧义时要求 `--transition-id`；**空列表**会提示"先 assign --to me 接管" |
 | 解决屏幕字段（含必填自定义字段） | 同上 + `?expand=transitions.fields` | **只有这里能拿到流转屏幕字段**（`editmeta` 拿的是编辑页，不含）；`resolve --dry-run` 会打印完整字段清单 |
+| 建单屏幕（可建类型/必填/词表） | `GET /rest/api/2/issue/createmeta`（`expand=projects.issuetypes.fields`） | `create` 的校验来源；`create --dry-run` 打印完整字段清单 |
+| 变更历史 | `GET /rest/api/2/issue/{KEY}?expand=changelog` | `changelog KEY` 输出（字段/流转/指派/链接改动） |
 | 中文标签 → 字段 id | 字段名与「影响范围/发生原因/解决方法/预防措施」归一化后互相包含匹配 | 归一化忽略空格/括号/标点差异；非中文实例改用 `--field "字段名=值"` |
 | select 下拉可选值 | 同一展开里的 `allowedValues` | 注意选项键是 `value`（不是 `name`）；传值自动校验并映射为 option id |
 | 字段值格式 | 字段 `schema.type` | option→`{"id":…}`；version 数组→`[{"name":…}]`；user→`{"name":…}`；文本框→原值 |
@@ -34,6 +36,7 @@
 7. **转交策略**：很多项目「解决」流转自带 post-function 会把经办人改成报告人（= 转测试），无需 `--assign`；如果你们没有，用 `--assign "测试员显示名"` 显式转交
 8. **别人的单怎么处理**：工作流常限制"只有经办人能流转"（表现为 transitions 空列表/无「接受」类流转）→ 先 `assign KEY --to me` 接管再流转；详见 docs/07
 9. 每个团队约定词表后，可以把词表抄进自己项目的备注文档，但**工具不依赖它**——随时以运行时输出为准
+10. **要建单时**：`create --project KEY --type 类型 --summary 占位 --dry-run` 先看建单屏幕必填字段与词表（同 resolve 机制）；正式建单前同样先 dry-run 给用户过目
 
 ## 3. 故障排查速查
 
@@ -56,6 +59,8 @@
 | 选项值不在词表 | resolve 自动列出可选项 → 换词重跑（**已在 POST 前中止，单子未动**） |
 | 「接受/解决」类流转不唯一或找不到 | 输出会列出候选 → `--transition-id <id>` 强制指定（先 `transitions KEY` 查 id） |
 | 必填字段未填，已中止 | 预检会列出缺失字段 id+名称 → `--field "标签=值"` 补齐；`--dry-run` 可先看全部字段清单 |
+| 建单报必填未填 / 类型不可用 | `create --dry-run` 会列出建单屏幕必填与可建类型；`--field "标签=值"` 补齐（词表以输出为准） |
+| 附件上传 403 / XSRF 报错 | 工具已自带 `X-Atlassian-Token: no-check`；仍 403 查该账号附件上传权限 |
 | 流转成功但读回不符 | `transitions KEY` 看当前状态可用流转再决定下一步；工具已把每个字段读回结果打出来 |
 | 贴了 browse 链接报「没有 jql 参数」 | browse 是单页链接；用过滤器页地址（`/issues/?jql=…`），或手动把 JQL 传给 `--jql` |
 | `[重试] HTTP 503 …` / `429` | 服务端抖动自动重试（≤2 次，尊重 Retry-After）；持续失败查网络/VPN |

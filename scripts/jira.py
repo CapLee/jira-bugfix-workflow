@@ -13,9 +13,10 @@
           projects（登记的项目）/ active_project（当前活动项目）/ default_jql（可选）。
 
 子命令: init / use / pconfig（初始化、活动项目、项目级配置）/ search / issue /
-        transitions / editmeta / start / resolve / assign / comment / whoami /
-        projects / fields / attachments
-写操作（start/resolve/assign/comment）均支持 --dry-run 预演，执行后自动读回验证。
+        changelog（变更历史）/ create（建单）/ transitions / editmeta / start /
+        resolve / assign / comment / whoami / projects / fields /
+        attachments（下载 / 列表 / 上传）
+写操作（start/resolve/assign/comment/create/附件上传）均支持 --dry-run 预演，执行后自动读回验证。
 不带 --jql/--url/--project 的 search 默认聚焦当前上下文项目：
      项目文件夹配置（就近 .jira-project.yaml，pconfig --here 管理）> 活动项目（use 切换）。
 未限定 project 的 --jql/--url 查询默认被拦截（确要跨项目需显式 --all-projects）。
@@ -27,6 +28,7 @@ import argparse
 import base64
 import getpass
 import json
+import mimetypes
 import os
 import re
 import ssl
@@ -37,7 +39,7 @@ import urllib.request
 from urllib.parse import urlencode, urlparse, parse_qs
 
 PROG = os.path.basename(sys.argv[0])
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # 运行期配置（main 里填充）：base / user / pw / token / insecure / timeout /
 #   projects / active / default_jql / path
@@ -229,10 +231,11 @@ def _retry_wait(e):
         return 2
 
 
-def _request(method, path, params=None, body=None, raw=False):
+def _request(method, path, params=None, body=None, raw=False, raw_body=None, headers=None):
     """带认证的请求；429/5xx/网络抖动自动重试（≤2 次）；证书失败自动降级不校验重试。
 
     path 以 http(s):// 开头时按绝对 URL 用（附件下载等场景），否则拼接 base_url。
+    raw_body/headers 用于非 JSON 请求体（附件上传 multipart）。
     """
     url = path if path.startswith(("http://", "https://")) else C["base"] + path
     if params:
@@ -245,9 +248,17 @@ def _request(method, path, params=None, body=None, raw=False):
         req.add_header("Authorization", f"Basic {token}")
     req.add_header("Accept", "application/json")
     data = None
-    if body is not None:
+    hdrs = dict(headers or {})
+    if raw_body is not None:
+        data = raw_body
+        req.add_header("Content-Type", hdrs.pop("Content-Type", None)
+                       or hdrs.pop("content-type", None) or "application/octet-stream")
+    elif body is not None:
         req.add_header("Content-Type", "application/json")
         data = json.dumps(body).encode()
+    for hk, hv in hdrs.items():
+        if hk.lower() != "content-type":
+            req.add_header(hk, hv)
 
     ctx_ok, ctx_no = _contexts()
     ctxs = [ctx_no] if C.get("insecure") else [ctx_ok, ctx_no]
@@ -642,6 +653,40 @@ def cmd_issue(args):
         print(text)
 
 
+# ---------------- changelog（变更历史） ----------------
+
+def cmd_changelog(args):
+    key = _key_arg(args.key)
+    _warn_project(key)
+    _, d = _request("GET", f"/rest/api/2/issue/{key}",
+                    params={"expand": "changelog", "fields": "summary"})
+    ch = d.get("changelog") or {}
+    hist = ch.get("histories") or []
+    if args.format == "json":
+        print(json.dumps({"key": d.get("key", key), "total": ch.get("total", len(hist)),
+                          "histories": hist}, ensure_ascii=False, indent=1))
+        return
+    summary = ((d.get("fields") or {}).get("summary") or "")
+    print(f"# {d.get('key', key)} 变更历史（{ch.get('total', len(hist))} 条）: {summary[:60]}")
+    if not hist:
+        print("（无变更记录——从没被改过的单）")
+        return
+    for i, h in enumerate(hist, 1):
+        who = (h.get("author") or {}).get("displayName", "-")
+        when = (h.get("created") or "").replace("T", " ")[:19]
+        print(f"{i:>3}. {when}  {who}")
+        for it in h.get("items") or []:
+            fld = it.get("field", "?")
+            fr = it.get("fromString")
+            to = it.get("toString")
+            if fr is None and "from" in it:
+                fr = it.get("from")
+            if to is None and "to" in it:
+                to = it.get("to")
+            print(f"     {fld}: {fr or '（空）'} -> {to or '（空）'}")
+    print(f"（共 {len(hist)} 条变更；状态流转/字段改动/经办人变化都会在这里出现）")
+
+
 # ---------------- transitions / start ----------------
 
 def cmd_transitions(args):
@@ -765,19 +810,24 @@ def _resolve_user(key, query):
     return cand[0]
 
 
-def cmd_assign(args):
-    key = _key_arg(args.key)
-    _warn_project(key)
-    q = (args.to or "").strip()
+def _pick_assignee(key, q):
+    """解析目标经办人（assign / create --assign 共用）。me=当前账号；否则按显示名/登录名解析。"""
+    q = (q or "").strip()
     if not q:
-        die("--to 不能为空（人员显示名/登录名，或 me 表示自己）")
+        die("人员不能为空（显示名/登录名，或 me 表示自己）")
     if q.lower() in ("me", "self", "我", "自己"):
         _, me = _request("GET", "/rest/api/2/myself")
         target = {"name": me.get("name"), "displayName": me.get("displayName")}
         if not target["name"]:
             die("无法获取当前用户名（/myself 未返回 name）")
-    else:
-        target = _resolve_user(key, q)
+        return target
+    return _resolve_user(key, q)
+
+
+def cmd_assign(args):
+    key = _key_arg(args.key)
+    _warn_project(key)
+    target = _pick_assignee(key, args.to)
     if args.dry_run:
         preview = json.dumps({"name": target["name"]}, ensure_ascii=False)
         print(f"[DRY-RUN] 将 PUT /rest/api/2/issue/{key}/assignee body: {preview}"
@@ -1195,9 +1245,74 @@ def cmd_fields(args):
     print(f"共 {n} 个字段（--query: {args.query or '无'}；不查全量时建议带 --query）")
 
 
+# ---------------- 附件（下载 / 列表 / 上传） ----------------
+
+def _build_multipart(field, filename, data, mime):
+    """构造 multipart/form-data 请求体（纯标准库，无第三方依赖）。"""
+    boundary = "----jira-py-" + os.urandom(8).hex()
+    head = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n")
+    body = head.encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def _upload_attachments(key, args):
+    files = []
+    for f in args.upload:
+        if not os.path.exists(f):
+            die(f"文件不存在: {f}")
+        if os.path.isdir(f):
+            die(f"这是目录不是文件: {f}")
+        files.append(f)
+    if args.dry_run:
+        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/attachments"
+              f"（multipart/form-data；带 X-Atlassian-Token: no-check）:")
+        for f in files:
+            print(f"  {os.path.abspath(f)}  ({_human(os.path.getsize(f))}，"
+                  f"上传名: {_safe_name(os.path.basename(f))})")
+        if args.comment:
+            print(f"[DRY-RUN] 上传成功后将补一条评论: {args.comment}")
+        print("（未发任何写请求；去掉 --dry-run 即执行）")
+        return
+    _, before = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "attachment"})
+    before_ids = {str(a.get("id")) for a in ((before.get("fields") or {}).get("attachment") or [])}
+    for f in files:
+        name = _safe_name(os.path.basename(f))
+        with open(f, "rb") as fp:
+            data = fp.read()
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        mp_body, ctype = _build_multipart("file", name, data, mime)
+        _, res = _request("POST", f"/rest/api/2/issue/{key}/attachments", raw_body=mp_body,
+                          headers={"Content-Type": ctype, "X-Atlassian-Token": "no-check"})
+        ids = "、".join(f"id={a.get('id')}" for a in (res or []) if isinstance(a, dict)) or "（响应未带 id）"
+        print(f"已上传: {name} ({_human(len(data))}) -> {key} {ids} @ {C['base']}")
+    if args.comment:
+        _, d = _request("POST", f"/rest/api/2/issue/{key}/comment", body={"body": args.comment})
+        print(f"已评论 {key} (comment id={d.get('id')})")
+    _, after = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "attachment"})
+    after_map = {_safe_name(a.get("filename") or ""): str(a.get("id"))
+                 for a in ((after.get("fields") or {}).get("attachment") or [])}
+    marks = []
+    for f in files:
+        name = _safe_name(os.path.basename(f))
+        aid = after_map.get(name)
+        marks.append(f"{name}(id={aid}) {'✓' if aid else '⚠ 读回未见，请核对'}")
+    print(f"读回附件: {'、'.join(marks)}")
+
+
 def cmd_attachments(args):
     key = _key_arg(args.key)
     _warn_project(key)
+    if args.upload:
+        if args.id or args.save_dir or args.list:
+            die("--upload 与 --id / --save-dir / --list 不能同时用（上传模式不下载）")
+        _upload_attachments(key, args)
+        return
+    if args.comment:
+        die("--comment 仅配合 --upload 使用")
+    if args.dry_run:
+        die("--dry-run 仅配合 --upload 使用（下载 / --list 是只读操作）")
     _, d = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "attachment"})
     atts = (d.get("fields") or {}).get("attachment") or []
     if not atts:
@@ -1208,6 +1323,12 @@ def cmd_attachments(args):
         if not atts2:
             die(f"未找到附件 id={args.id}（可用: {[(a.get('id'), a.get('filename')) for a in atts]}）")
         atts = atts2
+    if args.list:
+        for a in atts:
+            print(f"{a.get('id')}\t{a.get('filename')}\t{_human(a.get('size', 0))}\t"
+                  f"{(a.get('author') or {}).get('displayName', '-')}\t{(a.get('created') or '')[:19]}")
+        print(f"共 {len(atts)} 个附件（下载: {PROG} attachments {key}；上传: --upload <文件>）")
+        return
     save_dir = args.save_dir or os.path.join("jira-attachments", key)
     os.makedirs(save_dir, exist_ok=True)
     for a in atts:
@@ -1234,6 +1355,17 @@ def _wrap_value(meta, fid, raw):
             vals = "、".join(o["value"] for o in opts[:20])
             die(f"字段 {fid}({meta.get('name','?')}) 值「{raw}」不在可选值内，可选项: {vals}")
         return {"value": str(raw)}
+    if t in ("priority", "resolution"):
+        opts = [o for o in (meta.get("allowedValues") or [])
+                if isinstance(o, dict) and (o.get("name") or o.get("value"))]
+        for o in opts:
+            lbl = o.get("name") or o.get("value")
+            if _norm(lbl) == _norm(str(raw)):
+                return {"id": str(o["id"])}
+        if opts:
+            vals = "、".join((o.get("name") or o.get("value")) for o in opts[:20])
+            die(f"字段 {fid}({meta.get('name','?')}) 值「{raw}」不在可选值内，可选项: {vals}")
+        return {"name": str(raw)}
     if t == "user":
         return {"name": str(raw)}
     if t == "array" and sch.get("items") == "version":
@@ -1380,6 +1512,142 @@ def cmd_resolve(args):
         print(f"已转交经办人: {tgt.get('displayName')} (name={tgt['name']}) {mark}")
 
 
+# ---------------- create（建单） ----------------
+
+def _match_fields(fields_meta, label):
+    """按中文标签在字段元数据里匹配（归一化子串双向），返回 [(fid, meta)]。"""
+    nl = _norm(label)
+    hits = []
+    for fid, meta in (fields_meta or {}).items():
+        name = _norm((meta or {}).get("name", ""))
+        if name and (nl in name or name in nl):
+            hits.append((fid, meta))
+    return hits
+
+
+def cmd_create(args):
+    ctx, is_folder = _ctx_project()
+    proj = (args.project or ctx or "").strip().upper()
+    if not proj:
+        die(f"未指定项目且无上下文项目：加 --project <KEY>，或先 {PROG} use <项目>")
+    if args.project and ctx and proj != ctx.upper():
+        print(f"[提示] 将在项目 {proj} 建单（当前{'目录所属' if is_folder else '活动'}项目是 {ctx}）"
+              f"——确认无误", file=sys.stderr)
+    _, d = _request("GET", "/rest/api/2/issue/createmeta",
+                    params={"projectKeys": proj, "expand": "projects.issuetypes.fields"})
+    pk = ((d.get("projects") or []) or [{}])[0]
+    if not pk:
+        die(f"项目 {proj} 不存在或当前账号不可建单（createmeta 未返回）；"
+            f"先核对 KEY: {PROG} projects --query {proj}")
+    types = pk.get("issuetypes") or []
+    tname = (args.type or "").strip()
+    if not tname:
+        if len(types) == 1:
+            tname = types[0].get("name", "")
+        else:
+            die(f"请用 --type 指定工作项类型；{pk.get('key', proj)} 可建: "
+                + "、".join(t.get("name", "?") for t in types))
+    cands = [t for t in types if _norm(t.get("name", "")) == _norm(tname)] \
+        or [t for t in types if _norm(tname) and _norm(tname) in _norm(t.get("name", ""))]
+    if not cands:
+        die(f"类型「{tname}」在 {pk.get('key', proj)} 不可用（可能没权限或拼写不同）；可建: "
+            + "、".join(t.get("name", "?") for t in types))
+    if len(cands) > 1:
+        die(f"类型「{tname}」匹配到多个: " + "、".join(t.get("name", "?") for t in cands) + "；请写完整名称")
+    it = cands[0]
+    cm_fields = it.get("fields") or {}
+
+    desc = args.description
+    if args.description_file:
+        if not os.path.exists(args.description_file):
+            die(f"文件不存在: {args.description_file}")
+        with open(args.description_file, encoding="utf-8") as fp:
+            desc = fp.read()
+
+    body_fields = {"project": {"key": pk.get("key", proj)},
+                   "issuetype": ({"id": str(it["id"])} if it.get("id") else {"name": it.get("name")}),
+                   "summary": args.summary}
+    if desc:
+        body_fields["description"] = desc
+    field_names = {"summary": "summary"}
+    raw_fields = {}
+    if args.priority:
+        meta = cm_fields.get("priority") or {}
+        raw_fields["priority"] = args.priority
+        field_names["priority"] = meta.get("name", "优先级")
+        opts = [o for o in (meta.get("allowedValues") or []) if isinstance(o, dict)]
+        if opts:
+            print("优先级可选值: " + " / ".join((o.get("name") or o.get("value") or "") for o in opts[:12]))
+    for kv in args.field or []:
+        if "=" not in kv:
+            die(f"--field 格式应为 标签=值: {kv}")
+        label, val = kv.split("=", 1)
+        hits = _match_fields(cm_fields, label.strip())
+        if not hits:
+            die(f"字段「{label}」在建单屏幕中不存在（可先 --dry-run 查看全部字段名）")
+        if len(hits) > 1:
+            req = [h for h in hits if h[1].get("required")]
+            hits = req or hits
+        fid, meta = hits[0]
+        raw_fields[fid] = val.strip()
+        field_names.setdefault(fid, meta.get("name", fid))
+        opts = [o for o in (meta.get("allowedValues") or []) if isinstance(o, dict)]
+        if opts:
+            print(f"字段映射: {label} -> {fid}；可选值: "
+                  + " / ".join((o.get("value") or o.get("name") or "") for o in opts[:12]))
+    for fid, v in raw_fields.items():
+        body_fields[fid] = _wrap_value(cm_fields.get(fid) or {}, fid, v)
+
+    unfilled = []
+    for fid, meta in cm_fields.items():
+        if meta.get("required") and fid not in body_fields and not meta.get("hasDefaultValue"):
+            unfilled.append(f"{fid}({meta.get('name', '?')})")
+    if unfilled:
+        die(f"以下必填字段未填，已中止不建单: {unfilled}；"
+            f"可先 --dry-run 查看建单屏幕字段清单，再用 --field '字段名=值' 补齐")
+
+    payload = {"fields": body_fields}
+    if args.dry_run:
+        print(f"[DRY-RUN] 将 POST /rest/api/2/issue"
+              f"（项目 {pk.get('key', proj)} / 类型 {it.get('name')}）payload:")
+        print(json.dumps(payload, ensure_ascii=False, indent=1))
+        if args.assign:
+            print(f"[DRY-RUN] 建单成功后将转交经办人 → {args.assign}（届时解析人员并读回）")
+        print("[DRY-RUN] 建单屏幕字段清单（新项目探查用）:")
+        for fid, meta in sorted(cm_fields.items()):
+            req = "是" if meta.get("required") else "否"
+            print(f"  {fid}\t{meta.get('name', '?')}\t必填={req}"
+                  f"\t类型={(meta.get('schema') or {}).get('type', '?')}")
+        print("（未发任何写请求；去掉 --dry-run 即执行）")
+        return
+
+    _, res = _request("POST", "/rest/api/2/issue", body=payload)
+    nk = res.get("key") or res.get("id") or "?"
+    print(f"已创建 {nk}（{pk.get('key', proj)} / {it.get('name')}）@ {C['base']}")
+    fids = [f for f in body_fields if f not in ("project", "issuetype")]
+    base = ["summary", "status", "resolution", "issuetype", "priority", "assignee", "created"]
+    px = ",".join(dict.fromkeys(base + fids))
+    _, chk = _request("GET", f"/rest/api/2/issue/{nk}", params={"fields": px})
+    f = chk.get("fields") or {}
+    print(f"读回: {nk} -> {(f.get('status') or {}).get('name', '?')} | "
+          f"类型: {(f.get('issuetype') or {}).get('name', '-')} | "
+          f"经办人: {(f.get('assignee') or {}).get('displayName', '未指派')} | "
+          f"摘要: {(f.get('summary') or '')[:60]}")
+    ok_names = [field_names.get(fid, fid) for fid in fids if f.get(fid)]
+    miss = [field_names.get(fid, fid) for fid in fids if not f.get(fid)]
+    if miss:
+        print(f"[警告] 以下字段读回为空，请人工核对: {miss}", file=sys.stderr)
+    if ok_names:
+        print(f"[校验] 已读回字段: {'、'.join(ok_names)}")
+    if args.assign:
+        tgt = _pick_assignee(nk, args.assign)
+        _request("PUT", f"/rest/api/2/issue/{nk}/assignee", body={"name": tgt["name"]})
+        _, a = _request("GET", f"/rest/api/2/issue/{nk}", params={"fields": "assignee"})
+        cur = (a["fields"].get("assignee") or {})
+        mark = "✓" if cur.get("name") == tgt["name"] else "⚠ 读回与目标不一致，请核对"
+        print(f"已转交经办人: {tgt.get('displayName')} (name={tgt['name']}) {mark}")
+
+
 def main():
     global C
     try:
@@ -1389,7 +1657,7 @@ def main():
         pass
     p = argparse.ArgumentParser(
         prog=PROG,
-        description=f"JIRA REST CLI（纯数据流，v{VERSION}）—— 初始化/拉单/读单/流转/指派/评论，全部走 REST API，零浏览器。")
+        description=f"JIRA REST CLI（纯数据流，v{VERSION}）—— 初始化/拉单/读单/流转/指派/评论/建单/附件，全部走 REST API，零浏览器。")
     p.add_argument("--version", action="version", version=f"{PROG} {VERSION}")
     p.add_argument("--config", metavar="PATH", help=f"凭据文件路径（默认 {_default_creds_path()}）")
     p.add_argument("--profile", metavar="NAME", help=f"凭据 profile 名（读 {_profiles_dir()}/NAME.yaml；多实例/多账号）")
@@ -1441,6 +1709,11 @@ def main():
     i.add_argument("--format", choices=["md", "json"], default="md")
     i.set_defaults(fn=cmd_issue)
 
+    ch = sub.add_parser("changelog", help="查看单子变更历史（状态流转/字段/经办人变化；排查「更新了但看不出变化」）")
+    ch.add_argument("key")
+    ch.add_argument("--format", choices=["table", "json"], default="table")
+    ch.set_defaults(fn=cmd_changelog)
+
     tr = sub.add_parser("transitions", help="查看可用流转")
     tr.add_argument("key")
     tr.set_defaults(fn=cmd_transitions)
@@ -1468,6 +1741,19 @@ def main():
     r.add_argument("--dry-run", action="store_true", help="只预演不提交（并打印流转屏幕字段清单）")
     r.set_defaults(fn=cmd_resolve)
 
+    cr = sub.add_parser("create", help="建单（按建单屏幕校验必填/词表；--dry-run 可预演）")
+    cr.add_argument("--project", metavar="KEY", help="项目 KEY（省略=当前上下文项目：项目文件夹 > 活动项目）")
+    cr.add_argument("--type", metavar="类型", help="工作项类型（如 Bug/ST-BUG；省略且唯一时自动取）")
+    cr.add_argument("--summary", required=True, help="标题")
+    gd = cr.add_mutually_exclusive_group()
+    gd.add_argument("--description", help="描述（JIRA wiki 语法）")
+    gd.add_argument("--description-file", dest="description_file", help="描述从文件读取（UTF-8）")
+    cr.add_argument("--priority", help="优先级（按实例词表校验）")
+    cr.add_argument("--assign", help="经办人（显示名/登录名/me；建单后设置并读回）")
+    cr.add_argument("--field", action="append", help="附加字段 标签=值（可多次）")
+    cr.add_argument("--dry-run", action="store_true", help="只预演不提交（并打印建单屏幕字段清单）")
+    cr.set_defaults(fn=cmd_create)
+
     a = sub.add_parser("assign", help="改经办人（接管/转派/指派）；--to me 表示自己")
     a.add_argument("key")
     a.add_argument("--to", required=True, help="目标人显示名/登录名，或 me")
@@ -1493,10 +1779,14 @@ def main():
     fl.add_argument("--query", help="按名称/id 过滤（不区分大小写）")
     fl.set_defaults(fn=cmd_fields)
 
-    at = sub.add_parser("attachments", help="下载单子附件（截图等）")
+    at = sub.add_parser("attachments", help="附件：下载（默认）/ 列表（--list）/ 上传（--upload，可多次）")
     at.add_argument("key")
     at.add_argument("--save-dir", help="保存目录（默认 ./jira-attachments/<KEY>/）")
     at.add_argument("--id", help="只下载指定附件 id（可先跑 issue KEY 看列表）")
+    at.add_argument("--list", action="store_true", help="只列出附件（不下载）")
+    at.add_argument("--upload", action="append", metavar="FILE", help="上传附件（可多次；与下载/列表互斥）")
+    at.add_argument("--comment", help="配合 --upload：上传成功后补一条评论")
+    at.add_argument("--dry-run", action="store_true", help="配合 --upload：只预演不提交")
     at.set_defaults(fn=cmd_attachments)
 
     args = p.parse_args()

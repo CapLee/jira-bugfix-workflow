@@ -1,7 +1,7 @@
 ---
 name: jira-bugfix-workflow
-description: Use when 用纯数据流（REST API）处理 JIRA bug——拉单/读单/改码/接受/解决，含改别人的单、多实例切换。不要浏览器点击时。
-version: 2.2.0
+description: Use when 用纯数据流（REST API）处理 JIRA bug——拉单/读单/改码/接受/解决/建单/附件，含改别人的单、多实例切换。不要浏览器点击时。
+version: 2.4.0
 ---
 
 # JIRA Bug 纯数据流处理（jira.py）
@@ -14,6 +14,7 @@ version: 2.2.0
 - 用户要「拉 JIRA bug / 改 bug / 更新状态」，且环境能直连 JIRA REST（Server/DC 8.x Basic，或 Bearer/Cloud）
 - 用户要求「不要浏览器 / 不要模拟点击 / 纯数据流」
 - 用户要帮改**别人名下的单**、切换**多个 JIRA 实例/账号**（v2 能力）
+- 用户要**建单 / 上传附件 / 查变更历史**（v2.4：`create` / `attachments --upload` / `changelog`）
 
 ## 首次使用：先初始化
 
@@ -37,11 +38,14 @@ search --jql '…' [--max|--all] [--format table|json|md]   # 拉清单，自动
 search --project KEY                     # 临时只看某项目（ALL=不限）
 search --url '…/issues/?jql=…'           # 贴过滤器链接
 issue KEY [--save f.md]                  # 详情+评论+附件
-attachments KEY [--save-dir 目录]         # 下载附件（截图）
+changelog KEY [--format table|json]      # 变更历史（谁改了什么：流转/字段/指派/链接）
+attachments KEY [--save-dir 目录]         # 下载附件（截图）；--list 只列表；--upload 文件… 上传（+--comment/--dry-run）
 transitions KEY                          # 可用流转（空列表=不是你的单）
 start KEY [--dry-run]                    # 接受（未开始→Working）
 resolve KEY --impact … --cause … --solution … --prevention … \
   [--field '标签=值']… [--assign 人] [--comment 备注] [--dry-run]   # 解决+填字段+转交
+create --project X --type 类型 --summary '…' [--description '…'/--description-file f] [--priority P] [--assign 人] [--field '标签=值']… [--dry-run]
+                                         # 建单（建单屏幕必填/词表动态校验）
 assign KEY --to me|姓名 [--dry-run]       # 接管/转派经办人
 comment KEY --body '…' [--dry-run]        # 评论（@人写 [~登录名]）
 projects / fields [--query]              # 探查项目/字段（接入新环境）
@@ -66,7 +70,7 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 ## 铁律（写操作三保险 + 范围）
 
 - **范围铁律**：默认只查当前活动项目。用户没明说「跨项目/所有项目」时：不得用 `--all-projects`、不得写不带 project 的 JQL、不得 `--project` 别的项目；查询指向别的项目先停下确认或先 `use` 切换。工具对手写 JQL/链接已有硬护栏，不要尝试绕过。
-- start / resolve / assign / comment **永远等用户明确指令**；拿不准先 `--dry-run` 预演给用户过目（零写请求，打印完整 payload + 字段清单）
+- start / resolve / assign / comment / create / 附件上传 **永远等用户明确指令**；拿不准先 `--dry-run` 预演给用户过目（零写请求，打印完整 payload + 字段清单）
 - 执行后**必须读回验证**（脚本自动做：状态 + 每个已填字段逐项核对）
 - transition id / 字段 id / 下拉词表**永远运行时发现**，不硬编码；词表填错会在 POST 前中止并列出可选项
 - 多实例用 `--profile`；写操作输出带 `@ 实例`，执行前扫一眼防串库
@@ -80,8 +84,11 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 | 当前状态已不是「未开始」 | start 安全护栏：单已处理中；确要流转用 `--transition-id` |
 | `当前账号对 X 无任何可用流转` | 不是你的单 → `assign X --to me` |
 | JQL 里 `status = 未开始` 静默返 0 | 本实例用内部名：`status = "Initial"`（=未开始；保留字须加引号） |
+| 单「更新」翻转但内容疑似无变化 | `changelog KEY` 看变更历史（常见为改字段/补链接/附件，未必是评论）；元数据调整通常无需处理 |
 | 指派时提示「匹配到多个可指派人」 | 部分实例忽略查询词返回全量名单→脚本已客户端过滤；用完整显示名或完整登录名重试（不会乱指派） |
 | 无「接受/解决」类流转或歧义 | `transitions KEY` 看候选 → `--transition-id` |
 | 必填未填 | `--dry-run` 看屏幕字段清单 → `--field '标签=值'` |
+| 建单必填未填 / 类型不存在 | `create --dry-run` 会列出可建类型与建单屏幕必填；用 `--field '标签=值'` 补齐 |
+| 附件上传失败 | 工具已自带 `X-Atlassian-Token`；仍 403 查该账号是否可传附件 |
 | 贴 browse 链接报无 jql | 改用 `/issues/?jql=` 过滤器链接 |
 | 429/5xx | 自动重试（≤2 次）；持续失败查网络 |

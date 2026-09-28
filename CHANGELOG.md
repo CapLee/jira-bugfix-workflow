@@ -1,5 +1,15 @@
 # 更新日志
 
+## v2.4.0（2026-09）
+
+**对标 quectel-cli jira 补齐三项能力：变更历史 / 建单 / 附件上传**
+
+- 新增 `changelog KEY`：变更历史（状态流转/字段改动/经办人变化，`--format table|json`）——排查「更新了但看不出变化」一条命令搞定
+- 新增 `create`：建单——按建单屏幕（createmeta）动态校验可建类型/必填字段/词表；`--summary/--description/--description-file/--priority/--assign/--field` 组合；建前 `--dry-run` 预演（payload + 完整屏幕字段清单），建后读回逐项校验
+- `attachments` 升级：`--list` 只列附件；`--upload <文件>`（可多次）multipart 上传（纯标准库，自带 `X-Atlassian-Token`），可 `--comment` 补评论；上传后读回校验；`--dry-run` 预演
+- `assign` 抽出 `_pick_assignee` 供 `create --assign` 复用（人名解析逻辑不变）；`_wrap_value` 增加 priority/resolution 类型词表校验
+- 自测扩到 77 项离线断言（changelog/create/附件上传全路径：dry-run 零写入、断言请求体、读回校验）
+
 ## v2.3.0（2025-09）
 
 **项目文件夹配置（跟着项目走的拉单模板）**

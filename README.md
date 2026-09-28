@@ -6,7 +6,7 @@ JIRA Bug 处理「纯数据流」命令行工具：**拉清单 → 读详情 →
 
 ## 特性
 
-- **纯 API 数据流**：JQL 拉清单（可直接贴过滤器链接）、读详情+评论+附件、查流转、「接受」、填字段流转「解决」+转交、改经办人、加评论——全部 REST 直连
+- **纯 API 数据流**：JQL 拉清单（可直接贴过滤器链接）、读详情+评论+附件、查流转、「接受」、填字段流转「解决」+转交、改经办人、加评论、建单、附件上传、变更历史——全部 REST 直连
 - **动态发现，零硬编码**：transition id、自定义字段 id、下拉词表全部运行时从 JIRA 读取；**换项目、换实例不用改代码**；选项填错在请求发出前中止并列出可选项（不会盲发 400）
 - **通用**：JIRA Server / Data Center 8.x 开箱即用；可选 Bearer token（Server PAT）与 Cloud「邮箱+API Token」认证
 - **多实例/多账号**：`--profile 名字` 一键切换 JIRA 实例（凭据按 profile 分开存，互不干扰）
@@ -49,27 +49,33 @@ python3 jira.py search --jql 'JQL' [--max 100] [--all] [--format table|json|md]
 python3 jira.py search --url 'https://主机/issues/?jql=…'      # 直接贴过滤器链接（自动提取 JQL）
 python3 jira.py search --project BPM                          # 临时只看某项目（ALL=不限；不改活动项目）
 python3 jira.py issue KEY [--save x.md]                       # 详情+评论+附件（单号可只写数字=当前活动项目）
+python3 jira.py changelog KEY [--format table|json]           # 变更历史（谁改了什么：流转/字段/指派/链接）
 python3 jira.py attachments KEY [--save-dir 目录]              # 下载附件（截图等）
+python3 jira.py attachments KEY --list                        # 只列附件清单（不下载）
+python3 jira.py attachments KEY --upload 文件 [--comment '…'] [--dry-run]   # 上传附件（可多次 --upload）
 python3 jira.py transitions KEY                               # 看可用状态流转
 python3 jira.py start KEY [--dry-run]                         # 「接受」（未开始→Working）
 python3 jira.py resolve KEY --impact 影响范围 --cause 发生原因 \
     --solution 解决方法 --prevention 预防措施 \
     [--assign 测试员] [--field '标签=值']... [--comment '备注'] [--dry-run]
                                                               # 流转「解决」+填必填+转交
+python3 jira.py create --project X --type 类型 --summary '标题' \
+    [--description '…'|--description-file f] [--priority P] [--assign 人] [--field '标签=值']... [--dry-run]
+                                                              # 建单（建单屏幕必填/词表动态校验；先 --dry-run）
 python3 jira.py assign KEY --to me|姓名 [--dry-run]            # 接管/转派经办人（改别人的单用）
 python3 jira.py comment KEY --body '内容' [--dry-run]          # 加评论（协作/交接说明）
 python3 jira.py projects [--query 关键词]                      # 探查实例有哪些项目（接入新环境用）
 python3 jira.py fields [--query 关键词]                        # 探查字段 id/类型（配 --field 用）
 ```
 
-所有写操作（start / resolve / assign / comment）都支持 `--dry-run` 预演，且执行后自动读回验证。
+所有写操作（start / resolve / assign / comment / create / 附件上传）都支持 `--dry-run` 预演，且执行后自动读回验证。
 
 ## 文档目录
 
 | 文档 | 内容 |
 |---|---|
 | [docs/01-配置指南.md](docs/01-配置指南.md) | 环境要求、凭据配置（profile 多实例 / token 认证 / 常见坑）、冒烟验证、切换实例、安全说明 |
-| [docs/02-使用方法.md](docs/02-使用方法.md) | 全部 12 个命令参考、6 步数据处理工作流、`--dry-run` 预演、自然语言驱动对照表、完整实测示例 |
+| [docs/02-使用方法.md](docs/02-使用方法.md) | 全部 17 个命令参考、6 步数据处理工作流、`--dry-run` 预演、自然语言驱动对照表、完整实测示例 |
 | [docs/03-接入新项目与FAQ.md](docs/03-接入新项目与FAQ.md) | 工作原理（动态发现机制）、新 JIRA 环境接入检查清单、故障排查表、Cloud 适配说明 |
 | [docs/04-端到端实战示例.md](docs/04-端到端实战示例.md) | **新同事上手首选**：安装→初始化→查 bug→改 bug→更新状态→批量→收尾，全流程照抄即可 |
 | [docs/05-大白话速通版.md](docs/05-大白话速通版.md) | **给不看命令的人**：单据机器人比喻、三句话用法、对话演示、常见疑问大白话 |
@@ -81,7 +87,7 @@ python3 jira.py fields [--query 关键词]                        # 探查字段
 
 1. 把 [`SKILL.md`](SKILL.md)（或本 README + `docs/02-使用方法.md`）作为上下文提供给 AI
 2. AI 用「终端执行 `python3 jira.py <命令>`」完成拉单/读单/流转，用自身编码能力改代码
-3. 状态写操作（start / resolve / assign / comment）**必须等用户明确指令**再执行；拿不准先 `--dry-run` 预演给用户过目
+3. 状态写操作（start / resolve / assign / comment / create / 附件上传）**必须等用户明确指令**再执行；拿不准先 `--dry-run` 预演给用户过目
 4. 代码修复按团队规范只留工作区改动，提交由开发者自己完成
 
 用户侧一句话触发即可：
@@ -124,13 +130,13 @@ $ python3 jira.py resolve X-3 --impact "…" --cause "需求理解偏差" --solu
 ## 适用与限制
 
 - **适用**：JIRA Server / Data Center 8.x（HTTP Basic）。Bearer token（Server PAT）与 Cloud「邮箱+API Token」也可用（Cloud 部分用户字段差异见 docs/03 §4）
-- **限制**：不支持需要浏览器验证码/双因子且无独立密码的实例（可考虑浏览器同源 fetch 方案）；工具不创建/删除 issue，只处理已存在的单
+- **限制**：不支持需要浏览器验证码/双因子且无独立密码的实例（可考虑浏览器同源 fetch 方案）；删除 issue 不提供——建单 v2.4 起支持（`create`，写操作同样预演 + 读回）
 - 下拉词表、状态机名称因项目而异——工具全部运行时发现，**换项目、换实例不用改代码**（见 docs/03 接入清单、docs/07 场景指南）
 
 ## 开发者自测（改完 jira.py 跑一遍）
 
 ```bash
-python3 scripts/selftest_offline.py    # 离线 mock：66 项断言，零真实请求，退出码 0 = 全过
+python3 scripts/selftest_offline.py    # 离线 mock：77 项断言，零真实请求，退出码 0 = 全过
 ```
 
 ## License
