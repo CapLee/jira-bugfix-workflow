@@ -24,6 +24,9 @@
      全局配置（default_jql）> 内置默认。纯数字单号（如 issue 25）自动补上下文项目前缀。
 每个子命令 --help 有详细用法。错误退出码 1，正常 0。
 """
+import contextlib
+import hashlib
+import uuid
 import argparse
 import base64
 import getpass
@@ -32,6 +35,7 @@ import mimetypes
 import os
 import re
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -39,7 +43,7 @@ import urllib.request
 from urllib.parse import urlencode, urlparse, parse_qs
 
 PROG = os.path.basename(sys.argv[0])
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 # 运行期配置（main 里填充）：base / user / pw / token / insecure / timeout /
 #   projects / active / default_jql / path
@@ -231,21 +235,55 @@ def _retry_wait(e):
         return 2
 
 
+def _http_origin(url):
+    """Origin equality includes scheme, host and the effective port."""
+    parsed = urlparse(url)
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme.lower(), parsed.hostname, port
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_method() not in ("GET", "HEAD"):
+            raise urllib.error.HTTPError(req.full_url, code, "Write redirect requires read-back", headers, fp)
+        if urlparse(req.full_url).scheme == "https" and urlparse(newurl).scheme != "https":
+            raise urllib.error.HTTPError(req.full_url, code, "Blocked HTTPS downgrade", headers, fp)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and _http_origin(req.full_url) != _http_origin(newurl):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def _http_open(req, data, timeout, context):
+    """Use a scoped opener; this CLI is serial, and urlopen stays injectable."""
+    previous = urllib.request._opener
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context), _SafeRedirectHandler())
+    try:
+        urllib.request.install_opener(opener)
+        return urllib.request.urlopen(req, data, timeout=timeout)
+    finally:
+        urllib.request.install_opener(previous)
+
+
 def _request(method, path, params=None, body=None, raw=False, raw_body=None, headers=None):
-    """带认证的请求；429/5xx/网络抖动自动重试（≤2 次）；证书失败自动降级不校验重试。
+    """带认证的请求；仅 GET/HEAD 自动重试，写入异常先核对、不盲重发。
 
     path 以 http(s):// 开头时按绝对 URL 用（附件下载等场景），否则拼接 base_url。
     raw_body/headers 用于非 JSON 请求体（附件上传 multipart）。
     """
     url = path if path.startswith(("http://", "https://")) else C["base"] + path
+    if urlparse(C["base"]).scheme == "https" and urlparse(url).scheme != "https":
+        die("禁止将 HTTPS 请求降级到非 HTTPS 地址")
     if params:
         url += ("&" if "?" in url else "?") + urlencode(params)
     req = urllib.request.Request(url, method=method)
-    if C.get("token"):
-        req.add_header("Authorization", "Bearer " + C["token"])
-    else:
-        token = base64.b64encode(f"{C['user']}:{C['pw']}".encode()).decode()
-        req.add_header("Authorization", f"Basic {token}")
+    if _http_origin(url) == _http_origin(C["base"]):
+        if C.get("token"):
+            req.add_header("Authorization", "Bearer " + C["token"])
+        else:
+            token = base64.b64encode(f"{C['user']}:{C['pw']}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
     req.add_header("Accept", "application/json")
     data = None
     hdrs = dict(headers or {})
@@ -259,6 +297,8 @@ def _request(method, path, params=None, body=None, raw=False, raw_body=None, hea
     for hk, hv in hdrs.items():
         if hk.lower() != "content-type":
             req.add_header(hk, hv)
+    if _http_origin(url) != _http_origin(C["base"]):
+        req.remove_header("Authorization")
 
     ctx_ok, ctx_no = _contexts()
     ctxs = [ctx_no] if C.get("insecure") else [ctx_ok, ctx_no]
@@ -268,7 +308,7 @@ def _request(method, path, params=None, body=None, raw=False, raw_body=None, hea
         wait = None
         for idx, ctx in enumerate(ctxs):
             try:
-                with urllib.request.urlopen(req, data, timeout=C["timeout"], context=ctx) as r:
+                with _http_open(req, data, timeout=C["timeout"], context=ctx) as r:
                     rawb = r.read()
                     if raw:
                         return r.status, rawb
@@ -287,9 +327,17 @@ def _request(method, path, params=None, body=None, raw=False, raw_body=None, hea
                     detail = " | ".join(str(m) for m in msgs[:3])
                 except Exception:
                     pass
+                finally:
+                    e.close()
                 if e.code in (401, 403):
                     die(f"认证失败 HTTP {e.code}: {detail or '检查凭据文件或账号被 SSO 锁'}"
                         f"（凭据: {os.path.basename(C['path'])}）")
+                # Only explicit request rejection makes a write safe to retry.
+                # Gateways can return any 5xx (including 520) after upstream commit;
+                # timeouts, throttling and unrecognised statuses are also ambiguous.
+                rejected = e.code in (400, 401, 403, 404, 405, 409, 410, 413, 414, 415, 422)
+                if method not in ("GET", "HEAD") and not rejected:
+                    raise WriteUncertain(f"JIRA 写入响应 HTTP {e.code}，需要先读回确认结果")
                 if e.code in (429, 500, 502, 503, 504):
                     last_msg = f"HTTP {e.code} {method} {path}: {detail or e.reason}"
                     wait = _retry_wait(e)
@@ -299,6 +347,8 @@ def _request(method, path, params=None, body=None, raw=False, raw_body=None, hea
                 if _is_cert_err(e) and idx + 1 < len(ctxs):
                     print("[警告] 证书校验失败，已退回不校验重试（内网自签证书常见）", file=sys.stderr)
                     continue  # → 换不校验 ctx 再试
+                if method not in ("GET", "HEAD"):
+                    raise WriteUncertain("JIRA 写入连接中断，需要先读回确认结果")
                 last_msg = f"网络错误: {e}"
                 wait = 1
                 break
@@ -712,49 +762,8 @@ def _pick_transition(transitions, name_hint=None, to_category=None):
 
 
 def cmd_start(args):
-    key = _key_arg(args.key)
-    _warn_project(key)
-    _, d = _request("GET", f"/rest/api/2/issue/{key}/transitions")
-    ts = d.get("transitions", [])
-    if not ts:
-        die(f"当前账号对 {key} 无任何可用流转——常见原因：单子经办人不是你（工作流限制只有经办人能流转）或已到终态。"
-            f"如要接手处理，可先执行: {PROG} assign {key} --to me")
-    _, sd = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "status"})
-    st = sd["fields"]["status"]
-    cur_name = st.get("name", "?")
-    cur_cat = (st.get("statusCategory") or {}).get("key", "")
-    if args.transition_id:
-        tid = next((t for t in ts if t["id"] == str(args.transition_id)), None)
-        if not tid:
-            die(f"transition id {args.transition_id} 不在可用列表: {[t['id'] for t in ts]}")
-        pick = [tid]
-    else:
-        pick = _pick_transition(ts, name_hint="接受")
-        if not pick and cur_cat not in ("indeterminate", "done"):
-            working_like = [t for t in ts
-                            if any(k in _norm(t["to"].get("name", ""))
-                                   for k in ("working", "处理", "进行", "inprogress"))]
-            if len(working_like) == 1:
-                pick = working_like
-                print(f"[匹配] 按目标状态「{pick[0]['to']['name']}」选取流转（名称未含「接受」）", file=sys.stderr)
-        if not pick:
-            if cur_cat in ("indeterminate", "done"):
-                die(f"当前状态「{cur_name}」已不是「未开始」，无需「接受」；可用流转: "
-                    f"{[(t['id'], t['name'], t['to']['name']) for t in ts]}（确要流转用 --transition-id 指定）")
-            die(f"找不到「接受」类流转（未开始→处理中），可用: "
-                f"{[(t['id'], t['name'], t['to']['name']) for t in ts]}；可 --transition-id 指定")
-        if len(pick) > 1:
-            die(f"「接受」类流转不唯一，请 --transition-id 指定: {[(t['id'], t['name']) for t in pick]}")
-    tid = pick[0]
-    payload = {"transition": {"id": tid["id"]}}
-    if args.dry_run:
-        print(f"[DRY-RUN] 当前: {key} -> {cur_name}")
-        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/transitions body: "
-              f"{json.dumps(payload, ensure_ascii=False)}（{tid['name']} -> {tid['to']['name']}）")
-        print("（未发任何写请求；去掉 --dry-run 即执行）")
-        return
-    _request("POST", f"/rest/api/2/issue/{key}/transitions", body=payload)
-    print(f"已流转: {tid['name']} -> {tid['to']['name']} @ {C['base']}；读回: {_status_line(key)}")
+    result = _safe_start(_key_arg(args.key), args.dry_run, args.transition_id)
+    print(('[DRY-RUN] 预演（未写入）: ' if args.dry_run else '接受结果: ') + json.dumps(result, ensure_ascii=False))
 
 
 # ---------------- editmeta ----------------
@@ -843,29 +852,13 @@ def cmd_assign(args):
 
 
 def cmd_comment(args):
-    key = _key_arg(args.key)
-    _warn_project(key)
     if args.body_file:
-        if not os.path.exists(args.body_file):
-            die(f"文件不存在: {args.body_file}")
-        with open(args.body_file, encoding="utf-8") as fp:
-            body = fp.read()
+        with open(args.body_file, encoding='utf-8') as f:
+            body = f.read()
     else:
         body = args.body
-    if not body or not body.strip():
-        die("评论内容为空")
-    payload = {"body": body}
-    if args.dry_run:
-        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/comment body: "
-              f"{json.dumps(payload, ensure_ascii=False)}")
-        print("（未发任何写请求；去掉 --dry-run 即执行）")
-        return
-    _, d = _request("POST", f"/rest/api/2/issue/{key}/comment", body=payload)
-    cid = d.get("id")
-    _, chk = _request("GET", f"/rest/api/2/issue/{key}/comment/{cid}")
-    ok = str(chk.get("id")) == str(cid)
-    print(f"已评论 {key} (comment id={cid}) @ {C['base']}；"
-          f"读回: id={chk.get('id')} by {(chk.get('author') or {}).get('displayName','-')} {'✓' if ok else '⚠'}")
+    result = _safe_comment(_key_arg(args.key), body, args.dry_run)
+    print(('[DRY-RUN] 预演（未写入）: ' if args.dry_run else '评论结果: ') + json.dumps(result, ensure_ascii=False))
 
 
 def cmd_whoami(args):
@@ -1258,47 +1251,10 @@ def _build_multipart(field, filename, data, mime):
 
 
 def _upload_attachments(key, args):
-    files = []
-    for f in args.upload:
-        if not os.path.exists(f):
-            die(f"文件不存在: {f}")
-        if os.path.isdir(f):
-            die(f"这是目录不是文件: {f}")
-        files.append(f)
-    if args.dry_run:
-        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/attachments"
-              f"（multipart/form-data；带 X-Atlassian-Token: no-check）:")
-        for f in files:
-            print(f"  {os.path.abspath(f)}  ({_human(os.path.getsize(f))}，"
-                  f"上传名: {_safe_name(os.path.basename(f))})")
-        if args.comment:
-            print(f"[DRY-RUN] 上传成功后将补一条评论: {args.comment}")
-        print("（未发任何写请求；去掉 --dry-run 即执行）")
-        return
-    _, before = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "attachment"})
-    before_ids = {str(a.get("id")) for a in ((before.get("fields") or {}).get("attachment") or [])}
-    for f in files:
-        name = _safe_name(os.path.basename(f))
-        with open(f, "rb") as fp:
-            data = fp.read()
-        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        mp_body, ctype = _build_multipart("file", name, data, mime)
-        _, res = _request("POST", f"/rest/api/2/issue/{key}/attachments", raw_body=mp_body,
-                          headers={"Content-Type": ctype, "X-Atlassian-Token": "no-check"})
-        ids = "、".join(f"id={a.get('id')}" for a in (res or []) if isinstance(a, dict)) or "（响应未带 id）"
-        print(f"已上传: {name} ({_human(len(data))}) -> {key} {ids} @ {C['base']}")
+    results = [_safe_upload(key, f, args.dry_run) for f in args.upload]
     if args.comment:
-        _, d = _request("POST", f"/rest/api/2/issue/{key}/comment", body={"body": args.comment})
-        print(f"已评论 {key} (comment id={d.get('id')})")
-    _, after = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "attachment"})
-    after_map = {_safe_name(a.get("filename") or ""): str(a.get("id"))
-                 for a in ((after.get("fields") or {}).get("attachment") or [])}
-    marks = []
-    for f in files:
-        name = _safe_name(os.path.basename(f))
-        aid = after_map.get(name)
-        marks.append(f"{name}(id={aid}) {'✓' if aid else '⚠ 读回未见，请核对'}")
-    print(f"读回附件: {'、'.join(marks)}")
+        results.append(_safe_comment(key, args.comment, args.dry_run))
+    print(('[DRY-RUN] 预演（未写入）: ' if args.dry_run else '附件结果: ') + json.dumps(results, ensure_ascii=False))
 
 
 def cmd_attachments(args):
@@ -1374,142 +1330,10 @@ def _wrap_value(meta, fid, raw):
 
 
 def cmd_resolve(args):
-    key = _key_arg(args.key)
-    _warn_project(key)
-    # 1) 找「解决」流转，并带 transitions.fields 展开（transition screen 字段在此）
-    _, d = _request("GET", f"/rest/api/2/issue/{key}/transitions",
-                    params={"expand": "transitions.fields"})
-    ts = d.get("transitions", [])
-    if not ts:
-        die(f"当前账号对 {key} 无任何可用流转——常见原因：单子经办人不是你（工作流限制只有经办人能流转）或已到终态。"
-            f"如要接手处理，可先执行: {PROG} assign {key} --to me")
-    if args.transition_id:
-        t = next((x for x in ts if x["id"] == str(args.transition_id)), None)
-        if not t:
-            die(f"transition id {args.transition_id} 不在可用列表: {[x['id'] for x in ts]}")
-        pick = [t]
-    else:
-        pick = _pick_transition(ts, name_hint="解决") or [
-            x for x in ts if x["to"].get("statusCategory", {}).get("key") == "done"
-        ]
-        if not pick:
-            die(f"找不到「解决」类流转，可用: {[(x['id'], x['name'], x['to']['name']) for x in ts]}")
-        if len(pick) > 1:
-            die(f"「解决」类流转不唯一，请 --transition-id 指定: {[(x['id'], x['name']) for x in pick]}")
-    t = pick[0]
-    screen_fields = t.get("fields", {}) or {}
-
-    # 2) 构造 transition body 字段：中文标签 -> fieldId 动态匹配
-    def find_field(label):
-        nl = _norm(label)
-        hits = []
-        for fid, meta in screen_fields.items():
-            name = _norm(meta.get("name", ""))
-            if name and (nl in name or name in nl):
-                hits.append((fid, meta))
-        return hits
-
-    body_fields = {}
-    field_names = {}
-    values = {"影响范围": args.impact, "发生原因": args.cause,
-              "解决方法": args.solution, "预防措施": args.prevention}
-    for label, val in values.items():
-        if not val:
-            continue
-        hits = find_field(label)
-        if not hits:
-            print(f"[警告] 字段标签「{label}」未在流转屏幕中找到，跳过"
-                  f"（现有字段: {[m.get('name') for m in screen_fields.values()]}）", file=sys.stderr)
-            continue
-        if len(hits) > 1:
-            # 同名多字段（少见）：取必填的，仍多则取第一个
-            req = [h for h in hits if h[1].get("required")]
-            hits = req or hits
-        fid, meta = hits[0]
-        body_fields[fid] = val
-        field_names[fid] = meta.get("name", fid)
-        print(f"字段映射: {label} -> {fid}")
-        opts = [o for o in (meta.get("allowedValues") or []) if isinstance(o, dict) and o.get("value")]
-        if opts:
-            shown = " / ".join(o["value"] for o in opts[:12])
-            print(f"  可选值: {shown}{' …' if len(opts) > 12 else ''}")
-
-    # 3) resolution 值（Fixed 类自动挑）
-    if "resolution" in screen_fields and "resolution" not in body_fields:
-        meta = screen_fields["resolution"]
-        av = meta.get("allowedValues") or []
-        fixed = next((v for v in av if "fix" in _norm(v.get("name", ""))), None) or (av[0] if av else None)
-        if fixed:
-            body_fields["resolution"] = {"id": str(fixed["id"])}
-            field_names["resolution"] = "resolution"
-            print(f"resolution -> id {fixed['id']} ({fixed.get('name')})")
-
-    # 4) 用户附加 --field 标签=值
-    for kv in args.field or []:
-        if "=" not in kv:
-            die(f"--field 格式应为 标签=值: {kv}")
-        label, val = kv.split("=", 1)
-        hits = find_field(label.strip())
-        if not hits:
-            die(f"附加字段「{label}」未找到（可先 --dry-run 查看流转屏幕全部字段名）")
-        fid = hits[0][0]
-        body_fields[fid] = val.strip()
-        field_names.setdefault(fid, hits[0][1].get("name", fid))
-
-    # 5) 按字段 schema 包装值（先校验已填值：选项词表错会在这里拦截）
-    body_fields = {fid: _wrap_value(screen_fields.get(fid) or {}, fid, v) for fid, v in body_fields.items()}
-
-    # 6) 必填检查（transition screen 层，非 editmeta）
-    unfilled = []
-    for fid, meta in screen_fields.items():
-        if meta.get("required") and fid not in body_fields:
-            unfilled.append(f"{fid}({meta.get('name','?')})")
-    if unfilled:
-        die(f"以下必填字段未填，已中止不流转: {unfilled}；"
-            f"可先 --dry-run 查看屏幕字段清单，再用 --field '字段名=值' 补齐")
-
-    payload = {"transition": {"id": t["id"]}, "fields": body_fields}
-    if args.comment:
-        payload["update"] = {"comment": [{"add": {"body": args.comment}}]}
-
-    if args.dry_run:
-        print(f"[DRY-RUN] 当前: {_status_line(key)}")
-        print(f"[DRY-RUN] 将 POST /rest/api/2/issue/{key}/transitions payload:")
-        print(json.dumps(payload, ensure_ascii=False, indent=1))
-        if args.assign:
-            tgt = _resolve_user(key, args.assign)
-            print(f"[DRY-RUN] 将转交经办人 → {tgt.get('displayName')} (name={tgt['name']})")
-        print("[DRY-RUN] 流转屏幕字段清单（新实例探查用）:")
-        for fid, meta in screen_fields.items():
-            req = "是" if meta.get("required") else "否"
-            print(f"  {fid}\t{meta.get('name','?')}\t必填={req}\t类型={(meta.get('schema') or {}).get('type','?')}")
-        print("（未发任何写请求；去掉 --dry-run 即执行）")
-        return
-
-    # 7) 发流转 + 读回（状态/resolution/已填字段逐项核对）
-    _request("POST", f"/rest/api/2/issue/{key}/transitions", body=payload)
-    fids = sorted(body_fields.keys())
-    px = "status,resolution" + (("," + ",".join(fids)) if fids else "")
-    _, chk = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": px})
-    f = chk["fields"]
-    res = (f.get("resolution") or {}).get("name", "-")
-    print(f"已流转 {key}: {t['name']} -> {t['to']['name']} @ {C['base']}；"
-          f"读回: {key} -> {f['status']['name']} (resolution={res})")
-    ok_names = [field_names.get(fid, fid) for fid in fids if f.get(fid)]
-    empty_names = [field_names.get(fid, fid) for fid in fids if not f.get(fid)]
-    if empty_names:
-        print(f"[警告] 以下字段读回为空，请人工核对: {empty_names}", file=sys.stderr)
-    if ok_names:
-        print(f"[校验] 已读回字段: {'、'.join(ok_names)}")
-
-    # 8) 转交经办人（独立 PUT，便于回滚判断）
-    if args.assign:
-        tgt = _resolve_user(key, args.assign)
-        _request("PUT", f"/rest/api/2/issue/{key}/assignee", body={"name": tgt["name"]})
-        _, a = _request("GET", f"/rest/api/2/issue/{key}", params={"fields": "assignee"})
-        cur = (a["fields"].get("assignee") or {})
-        mark = "✓" if cur.get("name") == tgt["name"] else "⚠ 读回与目标不一致，请核对"
-        print(f"已转交经办人: {tgt.get('displayName')} (name={tgt['name']}) {mark}")
+    opts = vars(args).copy()
+    opts.pop('fn', None)
+    result = _safe_resolve(_key_arg(args.key), opts, args.dry_run)
+    print(('[DRY-RUN] 预演（未写入）: ' if args.dry_run else '解决结果: ') + json.dumps(result, ensure_ascii=False))
 
 
 # ---------------- create（建单） ----------------
@@ -1648,6 +1472,803 @@ def cmd_create(args):
         print(f"已转交经办人: {tgt.get('displayName')} (name={tgt['name']}) {mark}")
 
 
+# ---------------- production: durable, read-back verified operations ----------------
+
+class WriteUncertain(SystemExit):
+    """Write may have reached JIRA; never blindly resend."""
+    def __init__(self, message):
+        super().__init__(1)
+        self.message = message
+        print(f'[结果待核对] {message}；不会自动再次写入。', file=sys.stderr)
+
+
+def _runs_dir():
+    return os.environ.get('JIRA_RUNS_DIR') or os.path.join(_hermes_dir(), 'jira-runs')
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def _save_json(path, data):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + '.' + uuid.uuid4().hex + '.tmp'
+    try:
+        with open(tmp, 'x', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            result = json.load(f)
+        if not isinstance(result, dict):
+            raise ValueError('not object')
+        return result
+    except (OSError, ValueError):
+        die('任务记录不存在或已损坏，已停止；请保留原记录，不要盲目重建并再次执行。')
+
+
+@contextlib.contextmanager
+def _file_lock(path):
+    """Atomic process lock. Crash leaves a lock intentionally (manual inspection required)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        die(f'另一个任务可能仍在执行，已停止避免重复写入。若上次异常退出，请先确认旧进程已结束再移除锁：{path}')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid(), 'created': time.time()}, f)
+        yield
+    finally:
+        os.remove(path)
+
+
+def _effect(key, operation, payload, send, verify, dry_run=False):
+    """Keep an unresolved operation pinned even when a caller changes its payload."""
+    if dry_run:
+        return _effect_once(key, operation, payload, send, verify, True)
+    scope = {'instance': C['base'].rstrip('/'), 'user': _current_user(), 'key': key,
+             'operation': operation}
+    identity = dict(scope, payload=payload)
+    token = _digest(identity)
+    guard = os.path.join(_runs_dir(), 'pending', _digest(scope) + '.json')
+    effect = os.path.join(_runs_dir(), 'effects', token + '.json')
+    with _file_lock(guard + '.lock'):
+        old = _load_task(guard) if os.path.isfile(guard) else None
+        if old and (old.get('scope') != scope or old.get('active') not in (None, token)):
+            die(f'{key} 仍有结果未确认的同类操作，已停止；请使用原任务核对，不能改参数绕过。')
+        record = {'schema': 1, 'scope': scope, 'active': token}
+        _save_task(guard, record)
+        try:
+            result = _effect_once(key, operation, payload, send, verify)
+        except BaseException:
+            saved = _load_json(effect) if os.path.isfile(effect) else {}
+            if saved.get('status') == 'rejected':
+                record['active'] = None
+                _save_task(guard, record)
+            raise
+        record['active'] = None
+        _save_task(guard, record)
+        return result
+
+
+def _effect_once(key, operation, payload, send, verify, dry_run=False):
+    """Local journal plus remote reconciliation, not a claim of distributed exactly-once."""
+    identity = {'instance': C['base'].rstrip('/'), 'user': _current_user(), 'key': key,
+                'operation': operation, 'payload': payload}
+    path = os.path.join(_runs_dir(), 'effects', _digest(identity) + '.json')
+    if dry_run:
+        return {'status': 'planned', 'key': key, 'operation': operation, 'changes': payload}
+    with _file_lock(path + '.lock'):
+        old = _load_json(path) if os.path.isfile(path) else None
+        if old is not None and (old.get('identity') != identity or old.get('status') not in ('sending', 'uncertain', 'rejected', 'done')):
+            die('操作记录已损坏或不匹配，已停止，不能把它当成从未执行。')
+        if verify():
+            _save_json(path, {'identity': identity, 'status': 'done', 'verified_at': time.time()})
+            return {'status': 'skipped', 'key': key, 'operation': operation}
+        if old and old.get('status') in ('sending', 'uncertain', 'done'):
+            die(f'{key} 上次操作的结果与当前单据不一致，已停止避免重复写入；请先核对该单变更历史。')
+        _save_json(path, {'identity': identity, 'status': 'sending', 'started_at': time.time()})
+        uncertain = False
+        try:
+            send()
+        except WriteUncertain:
+            uncertain = True
+        except SystemExit:
+            _save_json(path, {'identity': identity, 'status': 'rejected', 'updated_at': time.time()})
+            raise
+        except (OSError, ValueError):
+            uncertain = True
+        try:
+            matched = verify()
+        except (SystemExit, OSError, ValueError):
+            matched = False
+        if not matched:
+            _save_json(path, {'identity': identity, 'status': 'uncertain', 'updated_at': time.time()})
+            die(f'{key} 写入结果尚未验证，已停止；恢复时只核对已有结果，不自动重复发送。')
+        _save_json(path, {'identity': identity, 'status': 'done', 'verified_at': time.time()})
+        return {'status': 'reconciled' if uncertain else 'done', 'key': key, 'operation': operation}
+
+
+def _issue_fields(key):
+    return _request('GET', f'/rest/api/2/issue/{key}')[1]['fields']
+
+
+def _user_id(user):
+    return (user or {}).get('name') or (user or {}).get('accountId')
+
+
+def _current_user():
+    me = _request('GET', '/rest/api/2/myself')[1]
+    uid = _user_id(me)
+    if not uid:
+        die('无法核实当前登录人，已停止写入。')
+    return uid
+
+
+def _workflow_names(kind):
+    defaults = {'working': 'Working,In Progress,处理中,进行中',
+                'qa': 'ST Check,待测试,待验证,待验收', 'start': '接受,Start Progress,开始处理',
+                'resolve': '解决,Resolve Issue,Resolve'}
+    ctx, _ = _ctx_project()
+    pc, _ = _load_project_cfg(ctx)
+    text = _nearby_cfg().get(kind + '_states' if kind in ('working', 'qa') else kind + '_transitions')
+    text = text or pc.get(kind + '_states' if kind in ('working', 'qa') else kind + '_transitions') or defaults[kind]
+    return {_norm(x) for x in text.split(',') if x.strip()}
+
+
+def _stage(fields):
+    st = fields.get('status') or {}
+    if (st.get('statusCategory') or {}).get('key') == 'done' or fields.get('resolution'):
+        return 'done'
+    if _norm(st.get('name')) in _workflow_names('qa'):
+        return 'qa'
+    if _norm(st.get('name')) in _workflow_names('working'):
+        return 'working'
+    return 'other'
+
+
+def _assert_owner(fields):
+    if _user_id(fields.get('assignee')) != _current_user():
+        die('该单不是当前账号经办，已停止；接管必须另外取得授权，批量任务不会替你抢单。')
+
+
+def _choose_transition(key, kind, transition_id=None):
+    ts = _request('GET', f'/rest/api/2/issue/{key}/transitions',
+                  params={'expand': 'transitions.fields'})[1].get('transitions') or []
+    if transition_id:
+        hits = [t for t in ts if str(t['id']) == str(transition_id)]
+    else:
+        hits = [t for t in ts if _norm(t.get('name')) in _workflow_names(kind)]
+        if kind == 'start' and not hits:
+            hits = [t for t in ts if _norm((t.get('to') or {}).get('name')) in _workflow_names('working')]
+    if len(hits) != 1:
+        die(f'{key} 没有唯一可用的目标流转，已停止；先查看当前状态与可用流转，不会猜选。')
+    return hits[0]
+
+
+def _field_equal(expected, actual):
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(k in actual and _field_equal(v, actual[k]) for k, v in expected.items())
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(expected) == len(actual) and all(
+            any(_field_equal(v, a) for a in actual) for v in expected)
+    return expected == actual or (expected is not None and actual is not None and str(expected) == str(actual))
+
+
+def _status_matches(expected, actual):
+    if expected.get('id') and actual.get('id'):
+        return str(expected['id']) == str(actual['id'])
+    return expected.get('name') == actual.get('name')
+
+
+def _transition_matches(key, target, values):
+    f = _issue_fields(key)
+    return _status_matches(target, f.get('status') or {}) and all(
+        _field_equal(v, f.get(k)) for k, v in values.items())
+
+
+def _send_transition(key, snapshot, transition, values):
+    current = _issue_fields(key)
+    if not _status_matches(snapshot['status'], current['status']) or (
+            snapshot.get('updated') and current.get('updated') != snapshot['updated']) or (
+            _user_id(snapshot.get('assignee')) != _user_id(current.get('assignee'))):
+        die(f'{key} 在检查期间已被改动，已停止；请重新读取，不覆盖别人的操作。')
+    _request('POST', f'/rest/api/2/issue/{key}/transitions',
+             body={'transition': {'id': transition['id']}, 'fields': values})
+
+
+def _safe_start(key, dry_run=False, transition_id=None, checkpoint=None, persist=None):
+    _validated_keys([key])
+    if checkpoint is None and not dry_run:
+        identity = [C['base'].rstrip('/'), _current_user(), key, transition_id]
+        path = os.path.join(_runs_dir(), 'start', _digest(identity) + '.json')
+        with _file_lock(path + '.lock'):
+            saved = _load_task(path) if os.path.isfile(path) else {'schema': 1, 'checkpoint': {}}
+            cp = saved['checkpoint']
+            return _safe_start(key, transition_id=transition_id, checkpoint=cp,
+                               persist=lambda: _save_task(path, saved))
+    f = _issue_fields(key)
+    cp = checkpoint if checkpoint is not None else {}
+    if not cp:
+        if _stage(f) in ('working', 'qa', 'done'):
+            return {'status': 'skipped', 'key': key, 'reason': '已处理或已交测试，不重复接受'}
+        _assert_owner(f)
+        t = _choose_transition(key, 'start', transition_id)
+        cp.update({'snapshot': f, 'transition': t})
+        if persist and not dry_run:
+            persist()
+    t, f = cp['transition'], cp['snapshot']
+    return _effect(key, 'start', {'from': f['status'], 'updated': f.get('updated'), 'to': t['to']},
+                   lambda: _send_transition(key, f, t, {}),
+                   lambda: _transition_matches(key, t['to'], {}), dry_run)
+
+
+def _resolve_values(screen, opts):
+    raw = {label: opts.get(name) for label, name in
+           [('影响范围', 'impact'), ('发生原因', 'cause'), ('解决方法', 'solution'), ('预防措施', 'prevention')] if opts.get(name)}
+    for kv in opts.get('field') or []:
+        if '=' not in kv:
+            die('附加字段必须是“字段名=内容”，未修改任何单据。')
+        k, v = kv.split('=', 1)
+        raw[k] = v
+    out = {}
+    for label, value in raw.items():
+        exact = [(fid, meta) for fid, meta in screen.items() if fid == label or _norm(meta.get('name')) == _norm(label)]
+        hits = exact or _match_fields(screen, label)
+        if len(hits) != 1:
+            die(f'字段“{label}”不存在或有歧义，已停止；请使用准确字段名称或编号。')
+        fid, meta = hits[0]
+        out[fid] = _wrap_value(meta, fid, value)
+    missing = [meta.get('name', fid) for fid, meta in screen.items() if meta.get('required') and fid not in out]
+    if missing:
+        die(f'还缺这些必填内容，未执行流转：{missing}')
+    return out
+
+
+def _resolve_target(key, fields, query):
+    if not query or query == 'reporter':
+        uid = _user_id(fields.get('reporter'))
+        if not uid:
+            die('无法取得报告人账号，已停止；不能猜测转交对象。')
+        return {'name': uid}
+    return _pick_assignee(key, query)
+
+
+def _check_handoff(key, cp, final=False):
+    """Do not finish an old handoff over a later human change."""
+    f = _issue_fields(key)
+    target = _user_id(cp['target'])
+    actual = _user_id(f.get('assignee'))
+    baseline = cp.get('handoff_snapshot') or cp['snapshot']
+    matched = _status_matches(cp['transition']['to'], f.get('status') or {})
+    matched = matched and all(_field_equal(v, f.get(k)) for k, v in cp['values'].items())
+    matched = matched and _user_id(f.get('reporter')) == _user_id(cp['snapshot'].get('reporter'))
+    if final or cp.get('assigned'):
+        matched = matched and actual == target
+    elif actual != target:
+        matched = matched and actual == _user_id(baseline.get('assignee'))
+        if cp.get('handoff_snapshot') and baseline.get('updated'):
+            matched = matched and baseline['updated'] == f.get('updated')
+    if not matched:
+        die(f'{key} 的状态、字段、报告人或经办人已有变化，停止旧交接，不覆盖他人的操作。')
+    return f
+
+
+def _safe_assign_target(key, target, dry_run=False, cycle=None, checkpoint=None):
+    uid = _user_id(target)
+    def send():
+        if checkpoint is not None:
+            _check_handoff(key, checkpoint)
+        _request('PUT', f'/rest/api/2/issue/{key}/assignee', body={'name': uid})
+    return _effect(key, 'assign', {'name': uid, 'cycle': cycle}, send,
+                   lambda: _user_id(_issue_fields(key).get('assignee')) == uid, dry_run)
+
+
+def _safe_resolve(key, opts, dry_run=False, checkpoint=None, persist=None):
+    _validated_keys([key])
+    opts = {k: v for k, v in opts.items() if k in _BATCH_OPTIONS and v is not None}
+    if opts.get('repo'):
+        opts['repo'] = os.path.abspath(opts['repo'])
+    if checkpoint is None and not dry_run:
+        path = os.path.join(_runs_dir(), 'resolve', _digest([C['base'].rstrip('/'), _current_user(), key]) + '.json')
+        with _file_lock(path + '.lock'):
+            saved = _load_task(path) if os.path.isfile(path) else {'schema': 1, 'options': opts, 'checkpoint': {}}
+            cp = saved['checkpoint']
+            if saved['options'] != opts and cp:
+                if not cp.get('completed') or _stage(_issue_fields(key)) in ('qa', 'done'):
+                    die('该单已有不同口径的交付记录，已停止；先核原任务，不能改参数绕过未完成步骤。')
+                saved = {'schema': 1, 'options': opts, 'checkpoint': {}}
+                cp = saved['checkpoint']
+            if (saved.get('result') or {}).get('status') == 'done':
+                _check_handoff(key, cp, final=True)
+                matches = cp and _transition_matches(key, cp['transition']['to'], cp['values'])
+                matches = matches and _user_id(_issue_fields(key).get('assignee')) == _user_id(cp['target'])
+                if opts.get('comment'):
+                    matches = matches and _comment_match(key, opts['comment'], _current_user()) is not None
+                if not matches:
+                    die(f'{key} 已完成任务的结果后来发生变化，已停止；请核对重开或人工变更，不重放旧任务。')
+                return {'status': 'skipped', 'key': key, 'reason': '已完成且重新读回一致'}
+            result = _safe_resolve(key, opts, checkpoint=cp,
+                                   persist=lambda: _save_task(path, saved))
+            saved['result'] = result
+            _save_task(path, saved)
+            return result
+    _validated_keys([key])
+    f = _issue_fields(key)
+    cp = checkpoint if checkpoint is not None else {}
+    if cp and cp.get('completed'):
+        _check_handoff(key, cp, final=True)
+        matched = _transition_matches(key, cp['transition']['to'], cp['values'])
+        matched = matched and _user_id(f.get('assignee')) == _user_id(cp['target'])
+        if opts.get('comment'):
+            matched = matched and _comment_match(key, opts['comment'], _current_user()) is not None
+        if not matched:
+            die('此前已完成的交付发生后续变化，不能重放旧任务。')
+        return {'status': 'skipped', 'key': key, 'reason': '已完成且读回一致'}
+    if not cp and _stage(f) in ('qa', 'done'):
+        return {'status': 'skipped', 'key': key, 'reason': '已交测试或已结束，不重复流转'}
+    if dry_run and not (opts.get('repo') and opts.get('fix_commits')):
+        evidence = {'verified': False, 'warning': '仅探查流转字段，未核实代码交付；正式执行必须提供仓库与修复提交。'}
+    else:
+        evidence = _verify_delivery(opts.get('repo'), opts.get('fix_commits') or [], opts.get('remote'), opts.get('branch'))
+    if not cp:
+        _assert_owner(f)
+        t = _choose_transition(key, 'resolve', opts.get('transition_id'))
+        if dry_run:
+            print('[DRY-RUN] 流转屏幕字段清单：' + json.dumps(t.get('fields') or {}, ensure_ascii=False), file=sys.stderr)
+        values = _resolve_values(t.get('fields') or {}, opts)
+        target = _resolve_target(key, f, opts.get('assign'))
+        cp.update({'snapshot': f, 'transition': t, 'values': values, 'target': target, 'evidence': evidence})
+        if persist and not dry_run:
+            persist()
+    else:
+        t, values, target = cp['transition'], cp['values'], cp['target']
+    payload = {'from': cp['snapshot']['status'], 'updated': cp['snapshot'].get('updated'),
+               'to': t['to'], 'fields': values}
+    step = _effect(key, 'resolve', payload,
+                   lambda: _send_transition(key, cp['snapshot'], t, values),
+                   lambda: _transition_matches(key, t['to'], values), dry_run)
+    if not dry_run and not _transition_matches(key, t['to'], values):
+        die('流转后状态或字段与目标不一致，不能标为成功。')
+    if not dry_run:
+        handoff = _check_handoff(key, cp)
+        if 'handoff_snapshot' not in cp:
+            cp['handoff_snapshot'] = {k: handoff.get(k) for k in ('status', 'updated', 'assignee', 'reporter')}
+            if persist:
+                persist()
+    assigned = _safe_assign_target(key, target, dry_run, cycle=_digest(payload), checkpoint=cp)
+    if not dry_run:
+        _check_handoff(key, cp, final=True)
+        cp['assigned'] = True
+        if persist:
+            persist()
+    comment = _safe_comment(key, opts['comment'], dry_run) if opts.get('comment') else None
+    if not dry_run:
+        _check_handoff(key, cp, final=True)
+        if opts.get('comment') and _comment_match(key, opts['comment'], _current_user()) is None:
+            die('交付评论未读回，不能标为完成。')
+        cp['completed'] = True
+        if persist:
+            persist()
+    return {'status': 'planned' if dry_run else 'done', 'key': key, 'transition': step,
+            'assign': assigned, 'comment': comment, 'delivery': evidence,
+            **({'fields': t.get('fields') or {}} if dry_run else {})}
+
+
+def _comment_match(key, body, author):
+    data = _read_comments(key)
+    if not data['complete']:
+        die('评论未完整读取，不能判断是否重复，已停止发送。')
+    return next((c for c in data['items'] if c.get('body') == body and _user_id(c.get('author')) == author), None)
+
+
+def _safe_comment(key, body, dry_run=False):
+    _validated_keys([key])
+    if not isinstance(body, str) or not body.strip():
+        die('评论内容为空，未发送。')
+    author = _current_user()
+    return _effect(key, 'comment', {'body': body, 'author': author},
+                   lambda: _request('POST', f'/rest/api/2/issue/{key}/comment', body={'body': body}),
+                   lambda: _comment_match(key, body, author) is not None, dry_run)
+
+
+def _attachment_match(key, name, data):
+    digest = hashlib.sha256(data).hexdigest()
+    for a in _issue_fields(key).get('attachment') or []:
+        if a.get('filename') == name and int(a.get('size', -1)) == len(data):
+            content = _request('GET', a['content'], raw=True)[1]
+            if hashlib.sha256(content).hexdigest() == digest:
+                return a
+    return None
+
+
+def _safe_upload(key, filename, dry_run=False):
+    _validated_keys([key])
+    if not os.path.isfile(filename):
+        die('待上传文件不存在或是目录，未上传。')
+    with open(filename, 'rb') as f:
+        data = f.read()
+    name = _safe_name(os.path.basename(filename))
+    mp, content_type = _build_multipart('file', name, data, mimetypes.guess_type(name)[0] or 'application/octet-stream')
+    return _effect(key, 'upload', {'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()},
+                   lambda: _request('POST', f'/rest/api/2/issue/{key}/attachments', raw_body=mp,
+                                    headers={'Content-Type': content_type, 'X-Atlassian-Token': 'no-check'}),
+                   lambda: _attachment_match(key, name, data) is not None, dry_run)
+
+
+# ---------------- production: batch plan / run / resume ----------------
+
+_BATCH_OPTIONS = {'impact', 'cause', 'solution', 'prevention', 'field', 'assign', 'comment',
+                  'fix_commits', 'transition_id', 'start_transition_id', 'repo', 'remote', 'branch'}
+
+
+def _save_task(path, task):
+    task['integrity'] = _digest({k: v for k, v in task.items() if k != 'integrity'})
+    _save_json(path, task)
+
+
+def _load_task(path):
+    task = _load_json(path)
+    if task.get('schema') != 1 or task.get('integrity') != _digest({k: v for k, v in task.items() if k != 'integrity'}):
+        die('任务记录校验失败，已停止；请勿直接修改执行记录，需要改口径应重新生成任务。')
+    return task
+
+
+def _batch_plan(manifest, path):
+    if set(manifest) - {'action', 'repo', 'remote', 'branch', 'issues'}:
+        die('批量清单含未识别配置，未创建任务；请检查文档中的字段名称。')
+    action = manifest.get('action')
+    if action not in ('start', 'resolve'):
+        die('批量任务只支持接受或解决，不执行任意命令。')
+    entries = manifest.get('issues')
+    if not isinstance(entries, list) or not entries or any(not isinstance(e, dict) for e in entries):
+        die('批量清单需要非空的单据列表。')
+    keys = _validated_keys([e.get('key') for e in entries])
+    if len(keys) != len(entries):
+        die('批量清单存在重复单号，已停止；每张单只能出现一次。')
+    normalized = []
+    for entry in entries:
+        if set(entry) - (_BATCH_OPTIONS | {'key'}):
+            die(f"{entry['key']} 含不认识的字段，未创建任务。")
+        opts = {k: manifest[k] for k in ('repo', 'remote', 'branch') if k in manifest}
+        opts.update({k: v for k, v in entry.items() if k != 'key'})
+        for name, value in opts.items():
+            if name not in ('field', 'fix_commits') and not isinstance(value, str):
+                die(f'配置“{name}”应是文本，未读取或修改任何单据。')
+        if opts.get('repo'):
+            opts['repo'] = os.path.abspath(opts['repo'])
+        if 'field' in opts and (not isinstance(opts['field'], list) or any(not isinstance(x, str) or '=' not in x for x in opts['field'])):
+            die('附加字段必须是“字段名=值”的列表，未创建任务。')
+        commits = opts.get('fix_commits') or []
+        if not isinstance(commits, list) or any(not isinstance(x, str) or not re.fullmatch(r'[a-fA-F0-9]{7,64}', x) for x in commits):
+            die('修复提交必须为提交哈希列表，不能猜测或填写分支名。')
+        if action == 'resolve' and (not commits or not opts.get('repo')):
+            die(f"{entry['key']} 缺少修复提交或代码仓库，未创建解决任务。")
+        normalized.append({'key': entry['key'], 'options': opts})
+    actor = _current_user()
+    rows = []
+    for entry in normalized:
+        f = _issue_fields(entry['key'])
+        rows.append({'key': entry['key'], 'options': entry['options'], 'status': 'pending',
+                     'snapshot': {k: f.get(k) for k in ('status', 'updated', 'assignee', 'reporter')},
+                     'start_checkpoint': {}, 'resolve_checkpoint': {}})
+    task = {'schema': 1, 'id': uuid.uuid4().hex, 'created_at': time.time(), 'action': action,
+            'instance': C['base'].rstrip('/'), 'actor': actor,
+            'project': keys[0].rsplit('-', 1)[0], 'items': rows}
+    with _file_lock(path + '.lock'):
+        if os.path.exists(path):
+            die('目标任务文件已存在，不能覆盖执行记录；请使用新文件名。')
+        _save_task(path, task)
+    return _batch_summary(task)
+
+
+def _batch_summary(task):
+    counts = {k: 0 for k in ('pending', 'running', 'planned', 'done', 'skipped', 'failed')}
+    for item in task['items']:
+        counts[item['status']] = counts.get(item['status'], 0) + 1
+    return {'id': task['id'], 'action': task['action'], 'project': task['project'],
+            'summary': counts, 'ok': not counts['failed'],
+            'items': [{k: item[k] for k in ('key', 'status', 'result', 'error') if k in item} for item in task['items']]}
+
+
+def _snapshot_unchanged(snapshot, fields):
+    return all(snapshot.get(k) == fields.get(k) for k in ('status', 'updated', 'assignee', 'reporter'))
+
+
+def _batch_run(path, execute=False):
+    with _file_lock(path + '.lock'):
+        task = _load_task(path)
+        if task['instance'] != C['base'].rstrip('/') or task['actor'] != _current_user():
+            die('当前 JIRA 实例或登录账号与创建任务时不同，已停止，避免串环境。')
+        _validated_keys([x['key'] for x in task['items']])
+        # Dry-run uses a memory copy and never writes checkpoints/effects.
+        save = (lambda: _save_task(path, task)) if execute else (lambda: None)
+        for item in task['items']:
+            key, opts = item['key'], item['options']
+            try:
+                current = _issue_fields(key)
+                if item['status'] == 'done':
+                    cp = item['resolve_checkpoint'] if task['action'] == 'resolve' else item['start_checkpoint']
+                    if task['action'] == 'resolve':
+                        _check_handoff(key, cp, final=True)
+                        matched = _transition_matches(key, cp['transition']['to'], cp['values'])
+                        matched = matched and _user_id(_issue_fields(key).get('assignee')) == _user_id(cp['target'])
+                        if opts.get('comment'):
+                            matched = matched and _comment_match(key, opts['comment'], task['actor']) is not None
+                    else:
+                        matched = _transition_matches(key, cp['transition']['to'], {})
+                    if not matched:
+                        die(f'{key} 完成后的状态已有变化，已停止重放旧任务；请核对重开或其他人的改动。')
+                    continue
+                if item['status'] == 'skipped':
+                    if not _snapshot_unchanged(item['skip_snapshot'], current):
+                        die(f'{key} 跳过后状态已改变，请重新规划，不重放旧任务。')
+                    continue
+                if not item['resolve_checkpoint'] and _stage(current) in ('qa', 'done'):
+                    item.update(status='skipped', result={'reason': '已交测试或已结束'},
+                                skip_snapshot={k: current.get(k) for k in ('status', 'updated', 'assignee', 'reporter')})
+                    save()
+                    continue
+                if not item['start_checkpoint'] and not item['resolve_checkpoint'] and not _snapshot_unchanged(item['snapshot'], current):
+                    die(f'{key} 在生成任务后已有改动，请重新核对清单。')
+                if task['action'] == 'start' and _stage(current) == 'working' and not item['start_checkpoint']:
+                    item.update(status='skipped', result={'reason': '已在处理中'},
+                                skip_snapshot={k: current.get(k) for k in ('status', 'updated', 'assignee', 'reporter')})
+                    save()
+                    continue
+                if task['action'] == 'resolve':
+                    # Never start a ticket whose fix has not been delivered.
+                    _verify_delivery(opts.get('repo'), opts.get('fix_commits'), opts.get('remote'), opts.get('branch'))
+                item['status'] = 'running'
+                item.pop('error', None)
+                save()
+                if task['action'] == 'start' or (not item['resolve_checkpoint'] and _stage(current) != 'working'):
+                    start = _safe_start(key, not execute, opts.get('start_transition_id'),
+                                        checkpoint=item['start_checkpoint'], persist=save)
+                    item['result'] = start
+                    save()
+                    if task['action'] == 'start':
+                        item['status'] = 'done' if execute else 'planned'
+                        save()
+                        continue
+                    if not execute:
+                        item.update(status='planned', result={'start': start,
+                                    'warning': '未开始单需先接受；解决屏幕将在接受后重新读取并校验，当前未执行任何写入。'})
+                        continue
+                result = _safe_resolve(key, opts, not execute, item['resolve_checkpoint'], save)
+                item.update(status='done' if execute else 'planned', result=result)
+            except (SystemExit, OSError, ValueError, KeyError) as e:
+                item.update(status='failed', error=f'{type(e).__name__}: 未完成；详见错误输出，恢复时先核对已有结果。')
+            save()
+        return _batch_summary(task)
+
+
+def cmd_batch(args):
+    if args.batch_command == 'plan':
+        source = os.path.abspath(args.file)
+        manifest = _load_json(source)
+        # Paths in manifests are relative to the manifest, never to an arbitrary harness cwd.
+        for obj in [manifest] + list(manifest.get('issues') or []):
+            if isinstance(obj, dict) and obj.get('repo'):
+                obj['repo'] = os.path.abspath(os.path.join(os.path.dirname(source), obj['repo']))
+        target = os.path.abspath(args.save) if args.save else os.path.join(_runs_dir(), uuid.uuid4().hex + '.json')
+        result = _batch_plan(manifest, target)
+        result['task_file'] = target
+    elif args.batch_command == 'status':
+        result = _batch_summary(_load_task(os.path.abspath(args.task)))
+    else:
+        result = _batch_run(os.path.abspath(args.task), args.execute)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result['ok']:
+        raise SystemExit(1)
+
+
+# ---------------- production: delivery evidence ----------------
+
+def _git(repo, *args, allowed=(0,)):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+    try:
+        p = subprocess.run(['git', '-C', repo, *args], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', env=env, timeout=90,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+    except (OSError, subprocess.TimeoutExpired):
+        die('无法核实代码仓库或远端连接，已阻止流转；请先检查 Git 连接。')
+    if p.returncode not in allowed:
+        die(f'代码交付检查失败（{args[0]}），已阻止流转；请核对仓库、分支和远端权限。')
+    return p.stdout.strip(), p.returncode
+
+
+def _verify_delivery(repo, fix_commits, remote=None, branch=None):
+    """A clean checkout alone is not proof: require explicit fixes on fresh remote refs."""
+    if not repo or not fix_commits:
+        die('尚未提供本单的修复提交与代码仓库，不能确认代码已交付，已阻止流转。')
+    for commit in fix_commits:
+        if not isinstance(commit, str) or not re.fullmatch(r'[a-fA-F0-9]{7,64}', commit):
+            die('修复提交编号格式不正确，请提供实际提交哈希，不接受分支名或自动猜测。')
+    repo = os.path.abspath(repo)
+    top, _ = _git(repo, 'rev-parse', '--show-toplevel')
+    dirty, _ = _git(repo, 'status', '--porcelain', '--untracked-files=normal')
+    if dirty:
+        die('代码仓库还有未提交或未跟踪改动，不能确认本次修复已完整交付，已阻止流转。')
+    head, _ = _git(repo, 'rev-parse', 'HEAD')
+    local_branch, _ = _git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD', allowed=(0, 1))
+    if not (remote and branch):
+        if remote or branch or not local_branch:
+            die('没有明确的目标远端分支，已阻止流转；请同时提供远端名与分支名。')
+        remote, _ = _git(repo, 'config', '--get', f'branch.{local_branch}.remote', allowed=(0, 1))
+        merge, _ = _git(repo, 'config', '--get', f'branch.{local_branch}.merge', allowed=(0, 1))
+        branch = merge[len('refs/heads/'):] if merge.startswith('refs/heads/') else ''
+    remotes, _ = _git(repo, 'remote')
+    if not remote or remote == '.' or remote not in remotes.splitlines() or not branch:
+        die('当前分支没有可核实的远端，已阻止流转；不能仅凭本地记录判断已推送。')
+    _git(repo, 'check-ref-format', f'refs/heads/{branch}')
+    # Unique private ref: a concurrent user fetch must not change our evidence.
+    ref = 'refs/jira-bugfix/checks/' + uuid.uuid4().hex
+    try:
+        _git(repo, 'fetch', '--no-tags', '--no-write-fetch-head', '--', remote,
+             f'refs/heads/{branch}:{ref}')
+        tip, _ = _git(repo, 'rev-parse', ref + '^{commit}')
+    finally:
+        _git(repo, 'update-ref', '-d', ref)
+    _, rc = _git(repo, 'merge-base', '--is-ancestor', head, tip, allowed=(0, 1))
+    if rc:
+        die('当前代码尚未完整进入目标远端分支（超前或分叉），已阻止流转。')
+    fixes = []
+    for commit in fix_commits:
+        sha, _ = _git(repo, 'rev-parse', '--verify', commit + '^{commit}')
+        for target in (head, tip):
+            _, rc = _git(repo, 'merge-base', '--is-ancestor', sha, target, allowed=(0, 1))
+            if rc:
+                die('指定修复不在当前代码或目标远端分支中，已阻止流转。')
+        fixes.append(sha)
+    head_after, _ = _git(repo, 'rev-parse', 'HEAD')
+    dirty_after, _ = _git(repo, 'status', '--porcelain', '--untracked-files=normal')
+    if head_after != head or dirty_after:
+        die('检查期间代码仓库发生变化，已阻止流转，请重新核对。')
+    return {'repo': top, 'head': head, 'remote': remote, 'branch': branch,
+            'remote_sha': tip, 'fix_commits': list(dict.fromkeys(fixes)), 'checked_at': time.time()}
+
+
+# ---------------- production: read-only analysis bundle ----------------
+
+def _validated_keys(keys):
+    """Never repair malformed keys; constrain new workflows to one explicit context."""
+    ctx, _ = _ctx_project()
+    out = []
+    for key in keys:
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*-[1-9][0-9]*", key):
+            die(f"单号格式不正确，请核对原文后重试：{key!r}")
+        if ctx and key.rsplit('-', 1)[0] != ctx:
+            die(f"当前项目是 {ctx}，不能把 {key} 混进本次任务；请先确认项目范围。")
+        if key not in out:
+            out.append(key)
+    if not out or len({k.rsplit('-', 1)[0] for k in out}) != 1:
+        die("请提供同一个项目内的单号，不能创建空任务或混合项目。")
+    return out
+
+
+def _read_collection(key, kind, embedded=None):
+    """Finish paginated comments/history; preserve a truthful partial flag on failure."""
+    data = embedded or {}
+    item_key = 'comments' if kind == 'comment' else 'histories'
+    if not isinstance(data, dict) or (item_key not in data and 'values' not in data):
+        return {'items': [], 'total': None, 'fetched': 0, 'complete': False,
+                'warnings': ['接口未返回该类资料，不能视为空记录或已读全。']}
+    items = list(data.get(item_key) or data.get('values') or [])
+    total = int(data['total']) if data.get('total') is not None else None
+    ended = data.get('isLast') is True
+    seen = {str(x.get('id')) for x in items if x.get('id') is not None}
+    complete = int(data.get('startAt', 0)) == 0
+    warnings = []
+    while (total is not None and len(items) < total) or (total is None and data.get('isLast') is False):
+        start = len(items)
+        try:
+            _, page = _request('GET', f'/rest/api/2/issue/{key}/{kind}',
+                               params={'startAt': start, 'maxResults': 100})
+            chunk = page.get(item_key) or page.get('values') or []
+            if page.get('total') is not None:
+                total = max(total or 0, int(page['total']))
+            ended = page.get('isLast') is True
+            data = page
+            fresh = [x for x in chunk if x.get('id') is None or str(x['id']) not in seen]
+            if not fresh or int(page.get('startAt', start)) != start:
+                warnings.append('分页接口未继续返回新记录，未把截断数据当作全量。')
+                complete = False
+                break
+            items.extend(fresh)
+            seen.update(str(x['id']) for x in fresh if x.get('id') is not None)
+        except (SystemExit, OSError, ValueError, AttributeError):
+            warnings.append('当前实例无法继续读取分页，以下资料不完整。')
+            complete = False
+            break
+    return {'items': items, 'total': total, 'fetched': len(items),
+            'complete': complete and (len(items) == total if total is not None else ended),
+            'warnings': warnings + (['接口未提供总数或结束标志，无法证明已读全。'] if total is None and not ended else [])}
+
+
+def _read_comments(key):
+    _, data = _request('GET', f'/rest/api/2/issue/{key}/comment',
+                       params={'startAt': 0, 'maxResults': 100})
+    return _read_collection(key, 'comment', data)
+
+
+def _collect_triage(keys):
+    keys = _validated_keys(keys)
+    rows, errors = [], []
+    for key in keys:
+        try:
+            _, data = _request('GET', f'/rest/api/2/issue/{key}', params={
+                'fields': 'summary,description,status,priority,issuetype,updated,assignee,reporter,resolution,comment,attachment',
+                'expand': 'changelog'})
+            f = data['fields']
+            comments = _read_collection(key, 'comment', f.get('comment'))
+            history = _read_collection(key, 'changelog', data.get('changelog'))
+            _, transitions = _request('GET', f'/rest/api/2/issue/{key}/transitions')
+            rows.append({'key': key, 'summary': f.get('summary'), 'description': f.get('description'),
+                         'status': f.get('status'), 'assignee': f.get('assignee'), 'reporter': f.get('reporter'),
+                         'updated': f.get('updated'), 'resolution': f.get('resolution'),
+                         'comments': comments, 'history': history, 'attachments': f.get('attachment') or [],
+                         'transitions': transitions.get('transitions') or [],
+                         'warnings': comments['warnings'] + history['warnings'],
+                         'complete': comments['complete'] and history['complete']})
+        except (SystemExit, OSError, ValueError, KeyError) as e:
+            errors.append({'key': key, 'error': f'读取失败（{type(e).__name__}），其余单据继续；详情见错误输出。'})
+    return {'ok': not errors, 'requested': len(keys), 'count': len(rows), 'issues': rows,
+            'errors': errors, 'complete': not errors and all(r['complete'] for r in rows)}
+
+
+def cmd_triage(args):
+    keys = list(args.keys or [])
+    if args.key_list:
+        keys.extend(args.key_list.split(','))
+    if not keys:
+        ctx, _ = _ctx_project()
+        if not ctx:
+            die('未确定项目，请先配置当前项目，避免读取其它项目的单据。')
+        query, source = _build_default_jql(ctx)
+        found, total = _fetch_issues(query, 'key', args.max, False)
+        keys = [x['key'] for x in found]
+        if not keys:
+            result = {'ok': True, 'requested': 0, 'count': 0, 'issues': [], 'errors': [], 'complete': True}
+        else:
+            result = _collect_triage(keys)
+        result['selection'] = {'jql': query, 'source': source, 'total': total, 'selected': len(keys)}
+    else:
+        result = _collect_triage(keys)
+    if args.format == 'json':
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+    else:
+        parts = [f"# Bug 分析资料：取得 {result['count']}/{result['requested']} 张"]
+        for r in result['issues']:
+            parts += [f"\n## {r['key']} {r['summary']}",
+                      f"状态：{(r['status'] or {}).get('name')}；资料完整：{r['complete']}",
+                      str(r['description'] or ''), '\n### 评论',
+                      *[str(c.get('body', '')) for c in r['comments']['items']],
+                      '\n### 附件/变更/可用流转',
+                      json.dumps({k: r[k] for k in ('assignee', 'reporter', 'attachments', 'history', 'transitions', 'warnings')},
+                                 ensure_ascii=False, indent=2)]
+        parts += [str(e) for e in result['errors']]
+        text = '\n'.join(parts)
+    if args.save:
+        with open(args.save, 'w', encoding='utf-8') as f:
+            f.write(text + '\n')
+        print(f'分析资料已保存：{os.path.abspath(args.save)}')
+    else:
+        print(text)
+    if not result['ok']:
+        raise SystemExit(1)
+
+
 def main():
     global C
     try:
@@ -1703,6 +2324,29 @@ def main():
                    help="逗号分隔字段列表")
     s.set_defaults(fn=cmd_search)
 
+    bt = sub.add_parser('batch', help='批量接受/解决：预演、逐项执行、失败续跑')
+    bs = bt.add_subparsers(dest='batch_command', required=True)
+    bp = bs.add_parser('plan', help='根据 JSON 清单创建只读计划，不改 JIRA')
+    bp.add_argument('--file', required=True, help='JSON 清单路径')
+    bp.add_argument('--save', help='执行记录路径，默认存入用户任务目录')
+    for verb in ('run', 'resume'):
+        br = bs.add_parser(verb, help='默认只预演；执行前需用户明确授权')
+        br.add_argument('task', help='plan 返回的任务记录文件')
+        mode = br.add_mutually_exclusive_group()
+        mode.add_argument('--execute', action='store_true', help='已取得用户授权，实际写入 JIRA')
+        mode.add_argument('--dry-run', action='store_true', help='只读预演（默认）')
+    bstatus = bs.add_parser('status', help='读取本地执行记录')
+    bstatus.add_argument('task')
+    bt.set_defaults(fn=cmd_batch)
+
+    ti = sub.add_parser('triage', help='只读：一次拉齐单据分析资料，不改代码或流转')
+    ti.add_argument('keys', nargs='*', help='同项目完整单号；不指定则读取默认队列')
+    ti.add_argument('--keys', dest='key_list', help='逗号分隔的同项目单号')
+    ti.add_argument('--max', type=int, default=10)
+    ti.add_argument('--format', choices=['json', 'md'], default='json')
+    ti.add_argument('--save', help='保存分析资料到文件')
+    ti.set_defaults(fn=cmd_triage)
+
     i = sub.add_parser("issue", help="拉单详情+评论+附件（单号可只写数字=当前活动项目）")
     i.add_argument("key")
     i.add_argument("--save", help="保存到文件（推荐 AI 阅读）")
@@ -1739,6 +2383,10 @@ def main():
     r.add_argument("--field", action="append", help="附加字段 标签=值（可多次）")
     r.add_argument("--transition-id", help="强制指定流转 id")
     r.add_argument("--dry-run", action="store_true", help="只预演不提交（并打印流转屏幕字段清单）")
+    r.add_argument('--repo', help='修复所在代码仓库（正式流转必须核实已推送）')
+    r.add_argument('--fix-commit', dest='fix_commits', action='append', help='本单修复提交哈希，可多次指定；不自动猜测')
+    r.add_argument('--remote', help='目标远端名，默认取当前分支上游')
+    r.add_argument('--branch', help='目标远端分支，与远端名同时指定')
     r.set_defaults(fn=cmd_resolve)
 
     cr = sub.add_parser("create", help="建单（按建单屏幕校验必填/词表；--dry-run 可预演）")

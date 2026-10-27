@@ -23,14 +23,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote_plus
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jira.py")
-BASE_TMP = tempfile.mkdtemp(prefix="jira-selftest-")
+SCRATCH = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'hermes', 'cache', 'scratch')
+os.makedirs(SCRATCH, exist_ok=True)
+BASE_TMP = tempfile.mkdtemp(prefix="jira-selftest-", dir=SCRATCH)
 PROJCFG = os.path.join(BASE_TMP, "proj-cfg")
 os.makedirs(PROJCFG, exist_ok=True)
 
 PORT = 0
 state = {"requests": [], "fail_search": 0, "assignee": {"name": "tester", "displayName": "测试员甲"},
          "posts": [], "puts": [], "uploaded_atts": [], "created_body": {},
-         "created_assignee": None, "last_upload_headers": {}}
+         "created_assignee": None, "last_upload_headers": {}, "comments": [],
+         "status": "Working", "transition_fields": {}, "uploaded_blobs": {}, "fail_assign_once": False}
 
 
 class H(BaseHTTPRequestHandler):
@@ -118,10 +121,10 @@ class H(BaseHTTPRequestHandler):
             if path in ("/rest/api/2/issue/T-1", "/rest/api/2/issue/STRUCTURING-1"):
                 k = path.rsplit("/", 1)[-1]
                 fields = {
-                    "status": {"name": "Working"}, "resolution": None, "assignee": state["assignee"],
+                    "status": {"name": state["status"]}, "resolution": None, "assignee": state["assignee"],
                     "summary": "示例 bug", "description": "步骤A\n\n期望X\n\n实际Y",
                     "priority": {"name": "P2-一般"}, "issuetype": {"name": "BUG"},
-                    "reporter": {"displayName": "测试员甲"}, "created": "2026-09-01", "updated": "2026-09-09",
+                    "reporter": {"name": "tester", "displayName": "测试员甲"}, "created": "2026-09-01", "updated": "2026-09-09",
                     "comment": {"comments": [{"author": {"displayName": "测试员甲"},
                                               "created": "2026-09-02", "body": "复测未通过"}]},
                     "attachment": [{"id": "55", "filename": "shot.png", "size": 1234,
@@ -132,6 +135,7 @@ class H(BaseHTTPRequestHandler):
                     "customfield_13209": "范围X", "customfield_15817": {"value": "需求理解偏差"},
                     "customfield_15818": {"value": "调整UI/样式"}, "customfield_15819": {"value": "无需额外措施"},
                 }
+                fields.update(state["transition_fields"])
                 resp = {"key": k, "fields": fields}
                 if "changelog" in (qs.get("expand") or [""])[0]:
                     resp["changelog"] = {"total": 2, "histories": [
@@ -176,6 +180,15 @@ class H(BaseHTTPRequestHandler):
                 return self._json(200, {"key": "T-999", "fields": fields})
             if path == "/rest/api/2/issue/NOKEY":
                 return self._json(404, {"errorMessages": ["Issue does not exist or you do not have permission to see it."]})
+            if path == "/rest/api/2/issue/T-1/comment":
+                return self._json(200, {'startAt': 0, 'total': len(state['comments']), 'comments': state['comments']})
+            if path in state['uploaded_blobs']:
+                b = state['uploaded_blobs'][path]
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
             if path == "/rest/api/2/issue/T-1/comment/9001":
                 return self._json(200, {"id": "9001", "body": "hello", "author": {"displayName": "测试员甲"}})
             if path == "/rest/api/2/user/assignable/search":
@@ -214,7 +227,9 @@ class H(BaseHTTPRequestHandler):
             m = re.search(rb'filename="([^"]*)"', rawb)
             fname = m.group(1).decode("utf-8", "replace") if m else "unknown"
             state["last_upload_headers"] = dict(self.headers)
-            att = {"id": "77", "filename": fname, "size": ln,
+            content = rawb.split(b'\r\n\r\n', 1)[1].rsplit(b'\r\n--', 1)[0]
+            state['uploaded_blobs'][f'/att/77/{fname}'] = content
+            att = {"id": "77", "filename": fname, "size": len(content),
                    "author": {"displayName": "测试员甲"},
                    "created": "2026-09-28T10:00:00.000+0800",
                    "content": f"http://127.0.0.1:{PORT}/att/77/{fname}"}
@@ -222,9 +237,15 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, [att])
         body = rawb.decode("utf-8", "replace")
         if path == "/rest/api/2/issue/T-1/transitions":
+            payload = json.loads(body)
+            state['transition_fields'].update(payload.get('fields') or {})
+            state['status'] = 'Working' if payload['transition']['id'] == '41' else 'ST Check'
             return self._empty(204)
         if path == "/rest/api/2/issue/T-1/comment":
-            return self._json(201, {"id": "9001", "body": "hello", "author": {"displayName": "测试员甲"}})
+            c = {'id': str(9001 + len(state['comments'])), 'body': json.loads(body)['body'],
+                 'author': {'name': 'tester', 'displayName': '测试员甲'}}
+            state['comments'].append(c)
+            return self._json(201, c)
         if path == "/rest/api/2/issue":
             state["created_body"] = (json.loads(body).get("fields") or {})
             return self._json(201, {"id": "888", "key": "T-999"})
@@ -235,6 +256,9 @@ class H(BaseHTTPRequestHandler):
         body = self._body()
         state["puts"].append((path, body))
         if path in ("/rest/api/2/issue/T-1/assignee", "/rest/api/2/issue/T-999/assignee"):
+            if state['fail_assign_once']:
+                state['fail_assign_once'] = False
+                return self._json(400, {'errorMessages': ['mock: assignment temporarily rejected']})
             name = json.loads(body)["name"]
             dn = {"tester": "测试员甲", "target1": "目标人乙", "target2": "目标人丙"}.get(name, name)
             state["assignee"] = {"name": name, "displayName": dn}
@@ -256,15 +280,41 @@ def ctl(**kw):
     urllib.request.urlopen(f"{BASE}/__ctl/set?{q}").read()
 
 
+# Real local Git delivery evidence for resolve tests; never touch a user repository.
+FIX_REPO = os.path.join(BASE_TMP, 'fix-repo')
+FIX_REMOTE = os.path.join(BASE_TMP, 'fix-remote.git')
+os.makedirs(FIX_REPO)
+def test_git(*args):
+    return subprocess.check_output(['git', '-C', FIX_REPO, *args], stderr=subprocess.DEVNULL,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).decode().strip()
+test_git('init', '--bare', FIX_REMOTE)
+test_git('init', '-b', 'main')
+test_git('config', 'user.name', 'Offline Test')
+test_git('config', 'user.email', 'offline@example.invalid')
+with open(os.path.join(FIX_REPO, 'fix.txt'), 'w', encoding='utf-8') as f:
+    f.write('T-1 tested repair')
+test_git('add', 'fix.txt')
+test_git('commit', '-m', 'T-1 fixture repair')
+FIX_SHA = test_git('rev-parse', 'HEAD')
+test_git('remote', 'add', 'origin', FIX_REMOTE)
+test_git('push', '-u', 'origin', 'main')
+
+
 def run(argv, env_extra=None, cwd=None):
     env = dict(os.environ)
+    for key in ('JIRA_PROJECT_CONFIG_PATH', 'JIRA_PROFILE', 'JIRA_CREDS_PATH'):
+        env.pop(key, None)
+    env['JIRA_RUNS_DIR'] = os.path.join(BASE_TMP, 'runs')
+    if 'resolve' in argv:
+        argv = [*argv, '--repo', FIX_REPO, '--fix-commit', FIX_SHA]
     env["JIRA_PROJECT_CONFIGS_DIR"] = PROJCFG   # 隔离：不受用户真实项目配置影响
     env["JIRA_NO_FOLDER_CFG"] = "1"             # 默认禁用「项目文件夹配置」（专项用例再打开）
     if env_extra:
         env.update(env_extra)
     return subprocess.run([sys.executable, SCRIPT, *argv], capture_output=True,
                           text=True, encoding="utf-8", env=env, cwd=cwd or BASE_TMP,
-                          stdin=subprocess.DEVNULL)
+                          stdin=subprocess.DEVNULL, timeout=120,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
 
 
 results = []
@@ -298,7 +348,7 @@ with open(os.path.join(profdir, "token-inst.yaml"), "w", encoding="utf-8") as fp
     fp.write(f"base_url: {BASE}\ntoken: SECRET123\ntimeout: 30\ninsecure: true\n")
 
 r = run(["--version"])
-check("01 version", r.returncode == 0 and "2.4.0" in r.stdout, r.stdout + r.stderr)
+check("01 version", r.returncode == 0 and "2.5.0" in r.stdout, r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "whoami"])
 last_auth = state["requests"][-1][2]
@@ -350,7 +400,7 @@ posts0, puts0 = len(state["posts"]), len(state["puts"])
 r = run(["--config", creds_basic, "resolve", "T-1", "--impact", "范围X", "--cause", "需求理解偏差",
          "--solution", "调整UI/样式", "--prevention", "无需额外措施", "--dry-run"])
 ok = (r.returncode == 0 and "[DRY-RUN]" in r.stdout and "customfield_15817" in r.stdout
-      and "字段清单" in r.stdout and len(state["posts"]) == posts0 and len(state["puts"]) == puts0)
+      and "planned" in r.stdout and len(state["posts"]) == posts0 and len(state["puts"]) == puts0)
 check("11 resolve dry-run no-write", ok, f"rc={r.returncode} posts {posts0}->{len(state['posts'])}\n{r.stdout}\n{r.stderr}")
 
 r = run(["--config", creds_basic, "resolve", "T-1", "--cause", "不存在XYZ", "--solution", "调整UI/样式",
@@ -359,17 +409,17 @@ check("12 dry-run bad option", r.returncode == 1 and "不在可选值内" in r.s
 
 r = run(["--config", creds_basic, "resolve", "T-1", "--impact", "X", "--cause", "需求理解偏差",
          "--solution", "调整UI/样式", "--dry-run"])
-check("13 dry-run required", r.returncode == 1 and "必填字段未填" in r.stderr, r.stdout + r.stderr)
+check("13 dry-run required", r.returncode == 1 and "必填内容" in r.stderr, r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "resolve", "T-1", "--impact", "范围X", "--cause", "需求理解偏差",
          "--solution", "调整UI/样式", "--prevention", "无需额外措施",
          "--assign", "目标人乙", "--comment", "已修复"])
-body = json.loads(state["posts"][-1][1])
-ok = (r.returncode == 0 and "已流转 T-1: 解决 -> ST Check" in r.stdout and "[校验]" in r.stdout
-      and "已转交经办人: 目标人乙 (name=target1) ✓" in r.stdout
+body = json.loads(next((b for p, b in state['posts'] if p.endswith('/transitions')), '{}'))
+ok = (r.returncode == 0 and '"status": "done"' in r.stdout and state['status'] == 'ST Check'
+      and state['assignee']['name'] == 'target1'
       and body["fields"]["customfield_13209"] == "范围X"
       and body["fields"]["customfield_15817"] == {"id": "1"}
-      and body["update"]["comment"][0]["add"]["body"] == "已修复")
+      and any(c["body"] == "已修复" for c in state["comments"]))
 check("14 resolve real", ok, f"rc={r.returncode} body={body}\n{r.stdout}\n{r.stderr}")
 
 r = run(["--config", creds_basic, "assign", "T-1", "--to", "me"])
@@ -398,7 +448,7 @@ check("17d assign ambiguous die", r.returncode == 1 and "匹配到多个可指�
       r.stdout + r.stderr)
 
 r = run(["--config", creds_basic, "comment", "T-1", "--body", "hello"])
-check("18 comment real", r.returncode == 0 and "读回: id=9001" in r.stdout, r.stdout + r.stderr)
+check("18 comment real", r.returncode == 0 and '"status": "done"' in r.stdout and state["comments"][-1]["body"] == "hello", r.stdout + r.stderr)
 
 posts0 = len(state["posts"])
 r = run(["--config", creds_basic, "comment", "T-1", "--body", "x", "--dry-run"])
@@ -429,6 +479,8 @@ check("24 fields filter", r.returncode == 0 and "customfield_13209" in r.stdout 
 r = run(["--config", creds_basic, "--insecure", "--timeout", "30", "whoami"])
 check("25 global flags", r.returncode == 0 and "身份:" in r.stdout, r.stdout + r.stderr)
 
+state['status'] = 'Initial'
+state['assignee'] = {'name': 'tester', 'displayName': '测试员甲'}
 r = run(["--config", creds_basic, "start", "T-1", "--dry-run"])
 check("26 start dry-run", r.returncode == 0 and "[DRY-RUN]" in r.stdout, r.stdout + r.stderr)
 
@@ -508,7 +560,7 @@ check("36 use auto-register", r.returncode == 0 and "已切换当前活动项目
       and "T,STRUCTURING,BPM" in txt, f"rc={r.returncode}\n{r.stdout}\n{txt}")
 
 r = run(["--config", creds_basic, "start", "W-1", "--dry-run"])
-check("37 start guard on non-todo", r.returncode == 1 and "已不是「未开始」" in r.stderr, r.stdout + r.stderr)
+check("37 start guard on non-todo", r.returncode == 0 and '"status": "skipped"' in r.stdout, r.stdout + r.stderr)
 
 # ---------- v2.2: 项目级配置 / 搜索硬护栏 ----------
 
@@ -684,8 +736,8 @@ check("59 upload dry-run no-write",
 r = run(["--config", creds_basic, "attachments", "T-1", "--upload", upf, "--comment", "附件说明"])
 rawp = next((b for p, b in reversed(state["posts"]) if p.endswith("/attachments")), "")
 hdrs = state.get("last_upload_headers") or {}
-ok = (r.returncode == 0 and "已上传: upload-me.txt" in r.stdout and "读回附件" in r.stdout
-      and "✓" in r.stdout and "comment id=9001" in r.stdout
+ok = (r.returncode == 0 and '"status": "done"' in r.stdout
+      and any(c['body'] == '附件说明' for c in state['comments'])
       and "upload-me.txt" in rawp and hdrs.get("X-Atlassian-Token") == "no-check")
 check("60 upload real (+comment, readback)", ok,
       f"rc={r.returncode}\n{r.stdout}\n{r.stderr}\nraw_head={rawp[:200]}\n{hdrs}")
@@ -726,6 +778,54 @@ r = run(["--config", creds_basic, "create", "--project", "T", "--type", "BUG", "
 ok = (r.returncode == 0 and "已创建 T-999" in r.stdout
       and "已转交经办人: 目标人乙 (name=target1) ✓" in r.stdout)
 check("66 create + assign", ok, f"rc={r.returncode}\n{r.stdout}\n{r.stderr}")
+
+# ---------- production: real CLI batch / resume against local HTTP + Git ----------
+state['status'] = 'Initial'
+state['assignee'] = {'name': 'tester', 'displayName': '测试员甲'}
+manifest_path = os.path.join(BASE_TMP, 'batch-input.json')
+task_path = os.path.join(BASE_TMP, 'batch-task.json')
+manifest = {'action': 'resolve', 'repo': FIX_REPO, 'issues': [
+    {'key': 'T-1', 'fix_commits': [FIX_SHA], 'impact': '批量范围', 'cause': '需求理解偏差',
+     'solution': '调整UI/样式', 'prevention': '无需额外措施', 'assign': '目标人丙', 'comment': 'batch verified'}]}
+with open(manifest_path, 'w', encoding='utf-8') as f:
+    json.dump(manifest, f, ensure_ascii=False)
+posts0, puts0 = len(state['posts']), len(state['puts'])
+r = run(['--config', creds_basic, 'batch', 'plan', '--file', manifest_path, '--save', task_path])
+check('67 batch plan zero-write', r.returncode == 0 and os.path.isfile(task_path)
+      and len(state['posts']) == posts0 and len(state['puts']) == puts0, r.stdout + r.stderr)
+r = run(['--config', creds_basic, 'batch', 'run', task_path])
+check('68 batch default is preview', r.returncode == 0 and '"planned": 1' in r.stdout
+      and len(state['posts']) == posts0 and len(state['puts']) == puts0, r.stdout + r.stderr)
+state['fail_assign_once'] = True
+r = run(['--config', creds_basic, 'batch', 'run', task_path, '--execute'])
+check('69 batch partial failure recorded', r.returncode == 1 and '"failed": 1' in r.stdout
+      and state['status'] == 'ST Check', r.stdout + r.stderr)
+transitions_before = sum(p.endswith('/transitions') for p, _ in state['posts'])
+r = run(['--config', creds_basic, 'batch', 'resume', task_path, '--execute'])
+check('70 batch resumes only remaining steps', r.returncode == 0 and '"done": 1' in r.stdout
+      and transitions_before == sum(p.endswith('/transitions') for p, _ in state['posts'])
+      and state['assignee']['name'] == 'target2'
+      and sum(c['body'] == 'batch verified' for c in state['comments']) == 1, r.stdout + r.stderr)
+posts0, puts0 = len(state['posts']), len(state['puts'])
+r = run(['--config', creds_basic, 'batch', 'resume', task_path, '--execute'])
+check('71 batch repeat zero-write', r.returncode == 0 and '"done": 1' in r.stdout
+      and len(state['posts']) == posts0 and len(state['puts']) == puts0, r.stdout + r.stderr)
+r = run(['--config', creds_basic, 'batch', 'status', task_path])
+check('72 batch status', r.returncode == 0 and '"done": 1' in r.stdout, r.stdout + r.stderr)
+r = run(['--config', creds_basic, 'triage', 'T-1', 'T-1'])
+d = json.loads(r.stdout) if r.returncode == 0 else {}
+check('73 triage JSON + dedupe', r.returncode == 0 and d.get('requested') == 1
+      and d['issues'][0]['history']['total'] == 2 and d['issues'][0]['reporter']['name'] == 'tester', r.stdout + r.stderr)
+r = run(['--config', creds_basic, 'comment', 'T-1', '--body', 'batch verified'])
+check('74 comment repeat zero-write', r.returncode == 0 and '"status": "skipped"' in r.stdout
+      and len(state['posts']) == posts0, r.stdout + r.stderr)
+r = run(['--config', creds_basic, 'attachments', 'T-1', '--upload', upf])
+check('75 upload repeat zero-write', r.returncode == 0 and '"status": "skipped"' in r.stdout
+      and len(state['posts']) == posts0, r.stdout + r.stderr)
+state['status'] = 'Initial'
+r = run(['--config', creds_basic, 'batch', 'resume', task_path, '--execute'])
+check('76 reopened task blocks replay', r.returncode == 1 and len(state['posts']) == posts0
+      and len(state['puts']) == puts0, r.stdout + r.stderr)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n===== {len(results) - len(failed)}/{len(results)} PASS =====")

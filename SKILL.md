@@ -1,7 +1,7 @@
 ---
 name: jira-bugfix-workflow
 description: Use when 用纯数据流（REST API）处理 JIRA bug——拉单/读单/改码/接受/解决/建单/附件，含改别人的单、多实例切换。不要浏览器点击时。
-version: 2.4.0
+version: 2.5.0
 ---
 
 # JIRA Bug 纯数据流处理（jira.py）
@@ -37,27 +37,31 @@ search --jql '…' [--max|--all] [--format table|json|md]   # 拉清单，自动
                                                           # 手写 JQL/链接未限定 project 会被拦截；跨项目要 --all-projects
 search --project KEY                     # 临时只看某项目（ALL=不限）
 search --url '…/issues/?jql=…'           # 贴过滤器链接
+triage [KEY …] [--max 10] [--format json|md] [--save f]  # 一次拿齐资料，标记完整性
 issue KEY [--save f.md]                  # 详情+评论+附件
 changelog KEY [--format table|json]      # 变更历史（谁改了什么：流转/字段/指派/链接）
 attachments KEY [--save-dir 目录]         # 下载附件（截图）；--list 只列表；--upload 文件… 上传（+--comment/--dry-run）
 transitions KEY                          # 可用流转（空列表=不是你的单）
 start KEY [--dry-run]                    # 接受（未开始→Working）
-resolve KEY --impact … --cause … --solution … --prevention … \
+resolve KEY --repo <业务仓库> --fix-commit <修复SHA> --impact … --cause … --solution … --prevention … \
   [--field '标签=值']… [--assign 人] [--comment 备注] [--dry-run]   # 解决+填字段+转交
 create --project X --type 类型 --summary '…' [--description '…'/--description-file f] [--priority P] [--assign 人] [--field '标签=值']… [--dry-run]
                                          # 建单（建单屏幕必填/词表动态校验）
 assign KEY --to me|姓名 [--dry-run]       # 接管/转派经办人
 comment KEY --body '…' [--dry-run]        # 评论（@人写 [~登录名]）
+batch plan --file input.json             # 保存批量清单与快照，不写 JIRA
+batch run|resume <任务文件> [--execute]  # 默认预演，明确授权后才加 --execute
+batch status <任务文件>                 # 查看本地结果
 projects / fields [--query]              # 探查项目/字段（接入新环境）
 ```
 
 ## 标准流程（六步）
 
 1. `search` 拉清单（不传条件=当前活动项目；`use` 切换）→ **编号呈现给用户**，等圈单（每轮 ≤5 张）
-2. `issue KEY` 逐张读详情+评论（需要时 `attachments` 下截图）
+2. `triage KEY …` 一次读取圈定单的详情、评论、附件清单、历史、流转；检查 `complete/total/fetched`，不完整不能当无记录（需要时 `attachments` 下截图）
 3. 用户确认后改码 + 自验证（改动只留工作区，**不 git commit**；涉及表/数据交付 DDL/DML）
 4. `start KEY` 接受（读回验证）
-5. 用户验收后 `resolve …` 填四项必填 + 版本 + 转交（读回逐字段验证）
+5. 用户明确授权流转后，`resolve … --repo <业务仓库> --fix-commit <修复SHA>` 核对修复已推送，填四项必填 + 版本 + 转交（默认逐单报告人）；工具不自动提交/推送。多单用 `batch plan/run/resume`，说明见 `docs/08-生产批量工作流.md`
 6. 汇报：单号+根因+改动文件+验证结果+状态
 
 ## 改别人的单（工作流常只允许经办人流转）
@@ -73,7 +77,9 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 - start / resolve / assign / comment / create / 附件上传 **永远等用户明确指令**；拿不准先 `--dry-run` 预演给用户过目（零写请求，打印完整 payload + 字段清单）
 - 执行后**必须读回验证**（脚本自动做：状态 + 每个已填字段逐项核对）
 - transition id / 字段 id / 下拉词表**永远运行时发现**，不硬编码；词表填错会在 POST 前中止并列出可选项
-- 多实例用 `--profile`；写操作输出带 `@ 实例`，执行前扫一眼防串库
+- 多实例用 `--profile`；执行前 `whoami` 核实例/账号；批量任务绑定实例/账号/项目，切错即停止
+- 幂等保护：同作者完整评论、同名同大小且内容哈希一致附件不重发；完成项续跑必须重新读回。JIRA 无服务端幂等键，不承诺跨机器 exactly-once。
+- `resolve --dry-run` 可无提交证据只探查字段，但结果会标明未验证交付；正式执行始终需要门禁。Windows 自测与 Git/Python 子进程显式无窗口启动，避免逐用例弹 CMD。
 
 ## 排错速查
 
@@ -81,7 +87,9 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 |---|---|
 | 401/403 | 凭据/SSO；视环境降级浏览器方案 |
 | 未初始化 / 未设活动项目 | `init` 向导 / `use <项目>`；`init --check` 自查 |
-| 当前状态已不是「未开始」 | start 安全护栏：单已处理中；确要流转用 `--transition-id` |
+| start 返回 skipped | 已 Working/QA/终态，安全跳过；不要用指定 id 强转 |
+| 代码交付检查未通过 | 提供本单实际修复 SHA，核工作区、上游与最新远端；不凭干净工作区判已修 |
+| 结果待核对 / 任务记录损坏 | 保留记录；先查远端结果，不删日志重试写入 |
 | `当前账号对 X 无任何可用流转` | 不是你的单 → `assign X --to me` |
 | JQL 里 `status = 未开始` 静默返 0 | 本实例用内部名：`status = "Initial"`（=未开始；保留字须加引号） |
 | 单「更新」翻转但内容疑似无变化 | `changelog KEY` 看变更历史（常见为改字段/补链接/附件，未必是评论）；元数据调整通常无需处理 |
@@ -91,4 +99,11 @@ projects / fields [--query]              # 探查项目/字段（接入新环境
 | 建单必填未填 / 类型不存在 | `create --dry-run` 会列出可建类型与建单屏幕必填；用 `--field '标签=值'` 补齐 |
 | 附件上传失败 | 工具已自带 `X-Atlassian-Token`；仍 403 查该账号是否可传附件 |
 | 贴 browse 链接报无 jql | 改用 `/issues/?jql=` 过滤器链接 |
-| 429/5xx | 自动重试（≤2 次）；持续失败查网络 |
+| 429/5xx | 读取自动重试（≤2 次）；写入结果不确定先读回，不盲重发 |
+| 中文检索失败（英文/数字正常） | 先查正文零宽字符（U+200B 等，AI 生成文档常见「每字夹 ZWSP」）→ 旧码全 0 命中属历史缺陷；先核构建时间线再动码 |
+
+## 巡检先核「构建时间线」（2026-10）
+
+QA 复测跑在**已部署构建**上，构建可能落后代码多天——新单先核再决定动不动码（实测：dev 前端最新构建停在数日前，当天修复全未上环境；QA 新报「中文无法检索」实为**已提交未构建**的零宽字符修复场景，码侧无需再改）。
+
+流程：① 当前代码复现（决定改不改码）② 核构建最后 sha/时间（Jenkins API `<job>/api/json?tree=builds[number,result,timestamp]` + 构建 `lastBuiltRevision.SHA1`）③ `git merge-base --is-ancestor <构建sha> <修复commit>` 成立 → 「码侧已修，待下次构建复测」，如实告知、勿重复改码。

@@ -14,8 +14,11 @@ JIRA Bug 处理「纯数据流」命令行工具：**拉清单 → 读详情 →
 - **拉单防跑偏**：手写 JQL/链接未限定 project **默认被拦截**（跨项目要显式 `--all-projects`）；查询指向别的项目会提示；支持两层项目模板：**项目文件夹** `.jira-project.yaml`（放项目根目录，就近发现）+ `hermes/jira-project-configs/<KEY>.yaml`（优先级：**项目文件夹 > 项目配置 > 全局配置 > 内置默认**，用 `pconfig` 管理）
 - **支持改别人的单**：`assign` 接管（`--to me`）/转派、`comment` 协作评论；权限不足时给出明确的下一步提示
 - **写操作三保险**：`--dry-run` 预演（不提交，可看将发送的完整 payload 与字段清单）+ 选项词表预校验 + 执行后自动读回验证（状态/字段逐项核对）
-- **零依赖**：Python 3 标准库（urllib），Windows / macOS / Linux 通用
-- **安全**：凭据存本地文件，脚本永不打印密码；429/5xx 自动重试；内网自签证书自动降级
+- **分析资料包**：`triage` 一次取详情、评论、附件清单、历史和流转；分页不完整明确标记
+- **批量可恢复**：`batch plan/run/resume/status`，默认只预演，串行执行、逐步落盘，已成功项重跑不重复写
+- **交付门禁与去重**：正式解决必须核明确修复提交已在最新远端；评论/附件核内容去重，未知写入结果先核实
+- **零依赖**：Python 3 标准库（urllib），Windows / macOS / Linux 通用；交付门禁需要 Git
+- **安全**：凭据存本地文件，脚本永不打印密码；读取 429/5xx 自动重试，写入异常不盲重发；内网自签证书自动降级
 
 ## 快速开始（3 步）
 
@@ -48,6 +51,12 @@ python3 jira.py search --jql 'JQL' [--max 100] [--all] [--format table|json|md]
                                                               # 手写 JQL/链接未限定 project 会被拦截；跨项目显式加 --all-projects
 python3 jira.py search --url 'https://主机/issues/?jql=…'      # 直接贴过滤器链接（自动提取 JQL）
 python3 jira.py search --project BPM                          # 临时只看某项目（ALL=不限；不改活动项目）
+python3 jira.py triage [KEY …] [--max 10] [--format json|md] [--save analysis.md]
+                                                              # 一次拿齐当前项目分析资料，标记完整性
+python3 jira.py batch plan --file input.json                    # 只读计划，返回任务文件
+python3 jira.py batch run <任务文件> [--execute]                # 默认预演，授权后显式执行
+python3 jira.py batch resume <任务文件> --execute               # 核已完成项后续跑
+python3 jira.py batch status <任务文件>                         # 查看本地结果
 python3 jira.py issue KEY [--save x.md]                       # 详情+评论+附件（单号可只写数字=当前活动项目）
 python3 jira.py changelog KEY [--format table|json]           # 变更历史（谁改了什么：流转/字段/指派/链接）
 python3 jira.py attachments KEY [--save-dir 目录]              # 下载附件（截图等）
@@ -55,7 +64,8 @@ python3 jira.py attachments KEY --list                        # 只列附件清�
 python3 jira.py attachments KEY --upload 文件 [--comment '…'] [--dry-run]   # 上传附件（可多次 --upload）
 python3 jira.py transitions KEY                               # 看可用状态流转
 python3 jira.py start KEY [--dry-run]                         # 「接受」（未开始→Working）
-python3 jira.py resolve KEY --impact 影响范围 --cause 发生原因 \
+python3 jira.py resolve KEY --repo <业务仓库> --fix-commit <本单修复SHA> \
+    --impact 影响范围 --cause 发生原因 \
     --solution 解决方法 --prevention 预防措施 \
     [--assign 测试员] [--field '标签=值']... [--comment '备注'] [--dry-run]
                                                               # 流转「解决」+填必填+转交
@@ -75,12 +85,13 @@ python3 jira.py fields [--query 关键词]                        # 探查字段
 | 文档 | 内容 |
 |---|---|
 | [docs/01-配置指南.md](docs/01-配置指南.md) | 环境要求、凭据配置（profile 多实例 / token 认证 / 常见坑）、冒烟验证、切换实例、安全说明 |
-| [docs/02-使用方法.md](docs/02-使用方法.md) | 全部 17 个命令参考、6 步数据处理工作流、`--dry-run` 预演、自然语言驱动对照表、完整实测示例 |
+| [docs/02-使用方法.md](docs/02-使用方法.md) | 全部命令参考、6 步数据处理工作流、`--dry-run` 预演、自然语言驱动对照表、完整实测示例 |
 | [docs/03-接入新项目与FAQ.md](docs/03-接入新项目与FAQ.md) | 工作原理（动态发现机制）、新 JIRA 环境接入检查清单、故障排查表、Cloud 适配说明 |
 | [docs/04-端到端实战示例.md](docs/04-端到端实战示例.md) | **新同事上手首选**：安装→初始化→查 bug→改 bug→更新状态→批量→收尾，全流程照抄即可 |
 | [docs/05-大白话速通版.md](docs/05-大白话速通版.md) | **给不看命令的人**：单据机器人比喻、三句话用法、对话演示、常见疑问大白话 |
 | [docs/06-新同事实录.md](docs/06-新同事实录.md) | **角色扮演版**：假装自己是新同事，从装 Python 到交单全流程实录，每步有屏幕输出 |
 | [docs/07-多实例与协作场景.md](docs/07-多实例与协作场景.md) | **换实例/换账号、改别人的 bug、团队协作**：profile 切换、接管别人名下的单、评论协作、转派交接全流程 |
+| [docs/08-生产批量工作流.md](docs/08-生产批量工作流.md) | **v2.5**：triage 资料包、修复提交门禁、批量计划/失败续跑、重复写入保护 |
 | [SKILL.md](SKILL.md) | 给 AI 助手用的技能文件（可直接装进 Hermes / Claude Code 等当 skill） |
 
 ## 给 AI 的使用方式（重要）
@@ -99,7 +110,15 @@ python3 jira.py fields [--query 关键词]                        # 探查字段
 - 「接一下张三的单 / 把这几张转给我」→ assign --to me 接管
 - 「把配置换成 XX 环境」→ --profile 切换实例
 
-## 典型输出
+## v2.5 使用变化
+
+- 正式 `resolve` 新增必需证据：`--repo` + `--fix-commit`（多笔重复传）；现场 fetch 核目标分支，不会自动 commit/push。只读探查 `resolve --dry-run` 可不提供证据，但不算交付已验证。
+- `start` 已 Working/QA/结束则跳过；`resolve` 默认转给该单报告人。批量只在明确授权后加 `--execute`。
+- 完整命令与 JSON 清单见 [生产工作流](docs/08-生产批量工作流.md)。`<…>` 均是占位说明，请替换真实值，不能连括号照填。
+
+## 典型输出（v2.4 历史实录）
+
+以下保留旧版实测记录，不是 v2.5 可直接运行的解决命令；当前参数和结构化结果以 docs/08 为准。
 
 ```
 $ python3 jira.py search --jql 'project = X AND resolution = Unresolved ...'
@@ -136,7 +155,8 @@ $ python3 jira.py resolve X-3 --impact "…" --cause "需求理解偏差" --solu
 ## 开发者自测（改完 jira.py 跑一遍）
 
 ```bash
-python3 scripts/selftest_offline.py    # 离线 mock：77 项断言，零真实请求，退出码 0 = 全过
+python3 scripts/selftest_offline.py    # 真实 CLI + 本地 HTTP/Git 模拟，零生产写入
+python3 -m unittest discover -s scripts -p 'test_*.py' -v  # 门禁/恢复/安全专项
 ```
 
 ## License
