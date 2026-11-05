@@ -15,7 +15,7 @@
 
 1. 将整个包解压到 AI 助手的技能目录，保留根目录 `SKILL.md` 和 `scripts/`。按宿主要求重新加载技能或新开会话。
 2. 安装 Python 3.8+；解决前交付检查需要 Git。公司 JIRA 必须可通过内网/VPN访问。每个人使用自己的 JIRA 账号。
-3. 首次运行 `python <技能目录>/scripts/jira.py init`：默认地址为 `https://ticket.quectel.com`，有可用的 quectel-cli JIRA 插件授权就直接复用，不再输入账号密码；没有时才在本机遮掩输入。已有账号配置优先，不会覆盖。
+3. 默认地址 `https://ticket.quectel.com`；首次运行 `python <技能目录>/scripts/jira.py init --dialog`，在本机弹窗输入用户名和密码，工具验证 JIRA 身份成功后才保存。密码不回显、不进聊天记录；已有配置直接使用，改密码重跑同一条命令。要设活动项目时才用 `use KEY`。
 
 `<…>` 是占位说明，替换真实值，不要连括号输入。macOS/Linux 可能使用 `python3`。
 

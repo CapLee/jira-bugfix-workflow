@@ -58,7 +58,7 @@ class DefaultBaseUrlTests(Base):
         path = self.config('check')
         before = path.read_bytes()
         output = io.StringIO()
-        with patch.object(j, '_request', return_value=(200, {'displayName': 'Fixture'})), \
+        with patch.object(j, '_request', return_value=(200, {'name': 'fixture-user', 'displayName': 'Fixture'})), \
                 patch.object(j, '_project_cfg_dir', return_value=str(self.root / 'projects')), \
                 contextlib.redirect_stdout(output):
             j._init_check(str(path))

@@ -10,7 +10,7 @@ JIRA Bug 处理「纯数据流」命令行工具：**拉清单 → 读详情 →
 - **动态发现，零硬编码**：transition id、自定义字段 id、下拉词表全部运行时从 JIRA 读取；**换项目、换实例不用改代码**；选项填错在请求发出前中止并列出可选项（不会盲发 400）
 - **通用**：JIRA Server / Data Center 8.x 开箱即用；可选 Bearer token（Server PAT）与 Cloud「邮箱+API Token」认证
 - **多实例/多账号**：`--profile 名字` 一键切换 JIRA 实例（凭据按 profile 分开存，互不干扰）
-- **初始化向导 + 活动项目**：默认 `https://ticket.quectel.com`；无单独账号配置时复用 quectel-cli 的 JIRA 插件授权，不复制密码、令牌。没有插件授权则保留原有初始化方式；已有账号配置优先。`init` 首次配好项目，日常不重复初始化；`use` 切换后，**默认一直聚焦当前活动项目**（不带条件的 `search`、纯数字单号都认它）
+- **初始化向导 + 活动项目**：默认 `https://ticket.quectel.com`；`init --dialog` 打开本机用户名/密码弹窗，先验证 JIRA 身份再保存，密码不回显、不进聊天记录。已有账号配置直接使用、不重复弹窗。`init` 首次配好项目，日常不重复初始化；`use` 切换后，**默认一直聚焦当前活动项目**（不带条件的 `search`、纯数字单号都认它）
 - **拉单防跑偏**：手写 JQL/链接未限定 project **默认被拦截**（跨项目要显式 `--all-projects`）；查询指向别的项目会提示；支持两层项目模板：**项目文件夹** `.jira-project.yaml`（放项目根目录，就近发现）+ `hermes/jira-project-configs/<KEY>.yaml`（优先级：**项目文件夹 > 项目配置 > 全局配置 > 内置默认**，用 `pconfig` 管理）
 - **支持改别人的单**：`assign` 接管（`--to me`）/转派、`comment` 协作评论；权限不足时给出明确的下一步提示
 - **写操作三保险**：`--dry-run` 预演（不提交，可看将发送的完整 payload 与字段清单）+ 选项词表预校验 + 执行后自动读回验证（状态/字段逐项核对）
@@ -27,8 +27,8 @@ JIRA Bug 处理「纯数据流」命令行工具：**拉清单 → 读详情 →
 git clone https://github.com/CapLee/jira-bugfix-workflow.git
 # 或只拷贝 scripts/jira.py 到任何目录
 
-# 2. 初始化（一次性，详见 docs/01-配置指南.md）—— 交互向导：填账号 → 现场验证 → 勾选项目 → 设活动项目
-python3 scripts/jira.py init
+# 2. 初始化（一次性，详见 docs/01-配置指南.md）—— 本机弹窗输入用户名/密码 → 现场验证 → 勾选项目 → 设活动项目
+python3 scripts/jira.py init --dialog
 #    不想交互也可以：直接建 %LOCALAPPDATA%\hermes\jira-api-creds.yaml（macOS/Linux ~/hermes/），填 base_url/username/password
 #    多实例：凭据放 hermes/jira-profiles/<名字>.yaml，用 --profile <名字> 切换
 

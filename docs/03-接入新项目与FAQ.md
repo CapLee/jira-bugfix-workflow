@@ -22,7 +22,7 @@
 
 ## 2. 新 JIRA 环境接入检查清单
 
-1. **初始化 + 认证体检**：`init --check` 看配置状态（未初始化就 `init` 向导走一遍），`whoami` 能输出身份即认证通。JIRA Server/DC 8.x 走 Basic；有 PAT 的实例可改用 `token:`（Bearer）；Cloud 用「邮箱+API Token」当 Basic（见 §4）
+1. **初始化 + 认证体检**：`init --check` 看配置状态（未初始化就 `init --dialog` 在本机弹窗走一遍），`whoami` 能输出身份即认证通。JIRA Server/DC 8.x 走 Basic；有 PAT 的实例可改用 `token:`（Bearer）；Cloud 用「邮箱+API Token」当 Basic（见 §4）
 2. **凭据**：按文档 01 配置并冒烟。多套环境并存用 **profile**（`--profile 名字`），别共用一份凭据来回改
 3. **摸清项目**：`projects --query 关键词` 找到项目 key → `search --jql 'project = KEY …'` 验证能拉到单
 4. **一次看清状态机+字段+词表**（读操作，零风险）：
@@ -47,7 +47,7 @@
 | `找不到 profile「xx」` | 按报错里列出的可用名字创建 `profiles/xx.yaml`（文件名必须=名字） |
 | `当前账号对 X 无任何可用流转` | 单子经办人不是你（工作流限制）→ `assign X --to me` 接管；或请原经办人转给你 |
 | `匹配到多个可指派人`（中止） | 部分实例忽略查询词、返回全量名单→脚本已客户端过滤；用完整显示名或完整登录名重试 |
-| `未初始化` / 缺字段 | 跑 `python3 jira.py init`（向导）；自查 `init --check` |
+| `未初始化` / 缺字段 | 跑 `python3 jira.py init --dialog`（本机弹窗）；自查 `init --check` |
 | `未设置活动项目` | `python3 jira.py use <项目>` 设置；或 --jql/--url/--project 显式指定 |
 | `该查询未限定项目…被拦截` | 护栏：手写 JQL/链接没带 project；补 `project = X`，或用户确认跨项目后加 `--all-projects` |
 | `查询未指向当前活动项目`（提示） | 检查 JQL 是否写错项目；临时看别的项目先 `use` 切换（确要跨项目加 `--all-projects`） |

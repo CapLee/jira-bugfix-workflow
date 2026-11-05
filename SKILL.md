@@ -27,8 +27,9 @@ version: 2.5.0
 
 ## 首次使用：先初始化
 
-- 默认地址 `https://ticket.quectel.com`。首次才运行 `init --check`；未就绪用 `init` 补齐，日常不重复让用户初始化。
-- 原有账号/PAT 配置优先；没有单独配置时复用 quectel-cli 的 **JIRA 插件授权**，只记录授权来源，不复制账号密码或令牌到技能配置。插件授权有效时不再问账号密码；过期就明确提示在 CLI 续期，不拿公司 SSO 登录令牌冒充 JIRA 授权。没有插件授权时保留原来的本机遮掩输入方式，绝不在聊天索要密码。
+- 默认地址 `https://ticket.quectel.com`。首次才运行 `init --check`；未就绪用 `init --dialog` 补齐，日常不重复让用户初始化。
+- 凭据只走本工具自己的账号密码：`init --dialog` 在本机打开一次用户名/密码弹窗，工具先请求 JIRA 核对身份，验证成功才写入配置；取消、认证失败或账号不匹配都不改动原配置。密码不回显，不进聊天、命令参数或日志。
+- 已有配置直接使用，不重复弹窗；改密码重跑 `init --dialog`。指定的 profile 或 `--config` 不存在就停止，不偷偷换账号。不再依赖 quectel-cli 插件授权；公司 SSO 登录不能代替 JIRA 账号。
 - 凭据文件（flat yaml：base_url / username / password，可选 token / insecure / timeout / projects / active_project / default_jql），默认 `%LOCALAPPDATA%\hermes\jira-api-creds.yaml`（macOS/Linux `~/hermes/…`）；多实例：`hermes/jira-profiles/<名字>.yaml` + `--profile <名字>`
 - **活动项目**：`use` 查看/切换；不带条件的 search、纯数字单号都聚焦当前活动项目
 - **项目文件夹配置（v2.3）**：在项目根目录放 `.jira-project.yaml`（`pconfig --here --set-project <KEY> --default-jql '…'` 写入）→ 在该目录（含子目录）裸跑 search / 纯数字单号都以它为准；优先级 **项目文件夹 > hermes 项目配置 <KEY>.yaml > 全局配置 > 内置默认**（显式 --jql/--url/--project 永远最高）

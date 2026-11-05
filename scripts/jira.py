@@ -30,6 +30,7 @@ import uuid
 import argparse
 import base64
 import getpass
+import io
 import json
 import mimetypes
 import os
@@ -130,6 +131,19 @@ def _read_flat(path):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
+            # New writes use JSON/YAML double-quoted scalars when raw values are lossy.
+            if ":" in line:
+                key, value = line.split(":", 1)
+                quoted = value.strip()
+                if quoted.startswith('"'):
+                    try:
+                        decoded, end = json.JSONDecoder().raw_decode(quoted)
+                        tail = quoted[end:].strip()
+                        if isinstance(decoded, str) and (not tail or tail.startswith("#")):
+                            creds[key.strip().lower()] = decoded
+                            continue
+                    except ValueError:
+                        pass  # Keep legacy non-JSON YAML values readable.
             # 注释仅当 # 前有空格或是行首（密码里的 # 不带空格不会被截断）
             ci = line.find(" #")
             if ci >= 0:
@@ -143,6 +157,16 @@ def _read_flat(path):
                 v = v[1:-1].strip()
             creds[k.strip().lower()] = v
     return creds
+
+
+def _flat_value(value):
+    value = str(value)
+    paired = ((value.startswith('"') and value.endswith('"'))
+              or (value.startswith("'") and value.endswith("'"))
+              or (value.startswith("<") and value.endswith(">")))
+    if value != value.strip() or " #" in value or "\\" in value or value.startswith('#') or paired or any(ord(c) < 32 for c in value):
+        return json.dumps(value, ensure_ascii=False)
+    return value
 
 
 def _update_cfg(path, updates):
@@ -161,212 +185,42 @@ def _update_cfg(path, updates):
         m = re.match(r"^(\s*)([A-Za-z_][\w-]*)\s*:", line)
         if m and m.group(2).lower() in updates:
             k = m.group(2).lower()
-            lines[i] = f"{m.group(1)}{k}: {updates[k]}\n"
+            lines[i] = f"{m.group(1)}{k}: {_flat_value(updates[k])}\n"
             found.add(k)
     for k, v in updates.items():
         if k not in found:
-            lines.append(f"{k}: {v}\n")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    os.replace(tmp, path)
-
-
-def _plugin_env():
-    """Read only the plugin's documented settings, never the CLI's SSO token."""
-    names = ("JIRA_URL", "JIRA_TOKEN", "JIRA_TOKEN_STORE")
-    values = {name: os.environ[name] for name in names if name in os.environ}
-    if os.name == "nt" and len(values) < len(names):
-        import winreg
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-                for name in names:
-                    if name not in values:
-                        try:
-                            value, _ = winreg.QueryValueEx(key, name)
-                            if isinstance(value, str):
-                                values[name] = value
-                        except FileNotFoundError:
-                            pass
-        except FileNotFoundError:
-            pass
-    return values
-
-
-def _decrypt_plugin_password(key, nonce, encrypted, user):
-    """Authenticated AES-GCM via the OS library; no extra Python dependency."""
-    import ctypes as ct
-    if len(nonce) != 12 or len(encrypted) < 16:
-        raise ValueError("JIRA 插件授权内容不完整，请在 CLI 中重新授权")
-    aad = user.encode("utf-8")
-    ciphertext, tag = encrypted[:-16], encrypted[-16:]
-    if os.name == "nt":
-        from ctypes import wintypes as wt
-
-        class AuthInfo(ct.Structure):
-            _fields_ = [("cbSize", wt.ULONG), ("dwInfoVersion", wt.ULONG),
-                        ("pbNonce", ct.c_void_p), ("cbNonce", wt.ULONG),
-                        ("pbAuthData", ct.c_void_p), ("cbAuthData", wt.ULONG),
-                        ("pbTag", ct.c_void_p), ("cbTag", wt.ULONG),
-                        ("pbMacContext", ct.c_void_p), ("cbMacContext", wt.ULONG),
-                        ("cbAAD", wt.ULONG), ("cbData", ct.c_ulonglong),
-                        ("dwFlags", wt.ULONG)]
-
-        lib = ct.WinDLL("bcrypt")
-        signatures = {
-            "BCryptOpenAlgorithmProvider": [ct.POINTER(ct.c_void_p), ct.c_wchar_p, ct.c_wchar_p, wt.ULONG],
-            "BCryptSetProperty": [ct.c_void_p, ct.c_wchar_p, ct.c_void_p, wt.ULONG, wt.ULONG],
-            "BCryptGenerateSymmetricKey": [ct.c_void_p, ct.POINTER(ct.c_void_p), ct.c_void_p,
-                                           wt.ULONG, ct.c_void_p, wt.ULONG, wt.ULONG],
-            "BCryptDecrypt": [ct.c_void_p, ct.c_void_p, wt.ULONG, ct.POINTER(AuthInfo), ct.c_void_p,
-                              wt.ULONG, ct.c_void_p, wt.ULONG, ct.POINTER(wt.ULONG), wt.ULONG],
-            "BCryptDestroyKey": [ct.c_void_p],
-            "BCryptCloseAlgorithmProvider": [ct.c_void_p, wt.ULONG],
-        }
-        for name, argtypes in signatures.items():
-            getattr(lib, name).argtypes = argtypes
-            getattr(lib, name).restype = ct.c_long
-
-        def checked(status):
-            if status != 0:
-                raise ValueError("JIRA 插件授权校验失败，请在 CLI 中重新授权")
-
-        algorithm, handle = ct.c_void_p(), ct.c_void_p()
-        output = ct.create_string_buffer(max(1, len(ciphertext)))
-        try:
-            checked(lib.BCryptOpenAlgorithmProvider(ct.byref(algorithm), "AES", None, 0))
-            mode = ct.create_unicode_buffer("ChainingModeGCM")
-            checked(lib.BCryptSetProperty(algorithm, "ChainingMode", mode, ct.sizeof(mode), 0))
-            secret = ct.create_string_buffer(key)
-            checked(lib.BCryptGenerateSymmetricKey(algorithm, ct.byref(handle), None, 0,
-                                                  secret, len(key), 0))
-            iv, auth, mac = (ct.create_string_buffer(value) for value in (nonce, aad, tag))
-            info = AuthInfo()
-            info.cbSize, info.dwInfoVersion = ct.sizeof(info), 1
-            info.pbNonce, info.cbNonce = ct.addressof(iv), len(nonce)
-            info.pbAuthData, info.cbAuthData = ct.addressof(auth), len(aad)
-            info.pbTag, info.cbTag = ct.addressof(mac), len(tag)
-            source = ct.create_string_buffer(ciphertext)
-            length = wt.ULONG()
-            checked(lib.BCryptDecrypt(handle, source, len(ciphertext), ct.byref(info), None, 0,
-                                      output, len(ciphertext), ct.byref(length), 0))
-            return output.raw[:length.value].decode("utf-8")
-        finally:
-            ct.memset(output, 0, ct.sizeof(output))
-            if handle.value:
-                lib.BCryptDestroyKey(handle)
-            if algorithm.value:
-                lib.BCryptCloseAlgorithmProvider(algorithm, 0)
-    else:
-        import ctypes.util
-        library = ctypes.util.find_library("crypto")
-        if not library:
-            raise ValueError("本机缺少系统加密库，无法复用插件授权；可使用原有账号配置")
-        lib = ct.CDLL(library)
-        signatures = {
-            "EVP_CIPHER_CTX_new": ([], ct.c_void_p),
-            "EVP_CIPHER_CTX_free": ([ct.c_void_p], None),
-            "EVP_aes_256_gcm": ([], ct.c_void_p),
-            "EVP_DecryptInit_ex": ([ct.c_void_p] * 5, ct.c_int),
-            "EVP_DecryptUpdate": ([ct.c_void_p, ct.c_void_p, ct.POINTER(ct.c_int), ct.c_void_p, ct.c_int], ct.c_int),
-            "EVP_CIPHER_CTX_ctrl": ([ct.c_void_p, ct.c_int, ct.c_int, ct.c_void_p], ct.c_int),
-            "EVP_DecryptFinal_ex": ([ct.c_void_p, ct.c_void_p, ct.POINTER(ct.c_int)], ct.c_int),
-        }
-        for name, (argtypes, restype) in signatures.items():
-            getattr(lib, name).argtypes, getattr(lib, name).restype = argtypes, restype
-        context = lib.EVP_CIPHER_CTX_new()
-        if not context:
-            raise ValueError("无法创建系统加密上下文")
-        output = ct.create_string_buffer(len(ciphertext) + 16)
-        try:
-            n, final = ct.c_int(), ct.c_int()
-            if (lib.EVP_DecryptInit_ex(context, lib.EVP_aes_256_gcm(), None, key, nonce) != 1
-                    or lib.EVP_DecryptUpdate(context, None, ct.byref(n), aad, len(aad)) != 1
-                    or lib.EVP_DecryptUpdate(context, output, ct.byref(n), ciphertext, len(ciphertext)) != 1
-                    or lib.EVP_CIPHER_CTX_ctrl(context, 0x11, len(tag), tag) != 1
-                    or lib.EVP_DecryptFinal_ex(context, ct.byref(output, n.value), ct.byref(final)) != 1):
-                raise ValueError("JIRA 插件授权校验失败，请在 CLI 中重新授权")
-            return output.raw[:n.value + final.value].decode("utf-8")
-        finally:
-            ct.memset(output, 0, ct.sizeof(output))
-            lib.EVP_CIPHER_CTX_free(context)
-
-
-def _plugin_credentials(base):
-    """Resolve the selected local JIRA token; never copy it to the skill config."""
-    from datetime import datetime, timezone
-    env = _plugin_env()
-    token = env.get("JIRA_TOKEN", "")
-    if not token:
-        return None
-    if (env.get("JIRA_URL") or DEFAULT_BASE_URL).rstrip("/") != base.rstrip("/"):
-        raise ValueError("JIRA 插件授权属于另一个地址，已停止复用；请为当前实例配置账号")
-    if token != token.strip() or token.startswith("JIRA_TOKEN="):
-        raise ValueError("JIRA 插件授权格式不正确，请在 CLI 中重新配置")
-    path = env.get("JIRA_TOKEN_STORE") or os.path.join(os.path.expanduser("~"), ".quectel-cli", "jira", "tokens.json")
+            lines.append(f"{k}: {_flat_value(v)}\n")
+    tmp = path + "." + uuid.uuid4().hex + ".tmp"
     try:
-        with open(path, encoding="utf-8") as file:
-            store = json.load(file)
-        if store.get("version") != 1 or not isinstance(store.get("tokens"), dict):
-            raise ValueError()
-        record = store["tokens"].get(hashlib.sha256(token.encode("utf-8")).hexdigest())
-        if not isinstance(record, dict) or not all(isinstance(record.get(k), str) for k in ("user", "nonce", "password")):
-            raise ValueError()
-        expiry = record.get("expires_at", "")
-        if not isinstance(expiry, str) or not expiry:
-            raise ValueError()
-        if expiry and expiry != "never":
-            expires = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            if expires.tzinfo is None:
-                raise ValueError()
-            if expires <= datetime.now(timezone.utc):
-                raise ValueError("JIRA 插件授权已过期，请在 CLI 中重新授权；公司 SSO 登录不能代替它")
-        cipher = record.get("cipher") or "legacy-v1"
-        if cipher not in ("bound-v2", "legacy-v1"):
-            raise ValueError("当前 JIRA 插件授权格式暂不支持，请使用原有账号配置")
-        material = token + (":quectel-cli-jira::token::20260729::v2" if cipher == "bound-v2" else "")
-        key = hashlib.sha256(material.encode("utf-8")).digest()
-        def decode(value):
-            return base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
-        password = _decrypt_plugin_password(key, decode(record["nonce"]), decode(record["password"]), record["user"])
-        if not record["user"] or not password:
-            raise ValueError()
-        return {"user": record["user"], "pw": password, "token": "", "auth_source": "quectel-cli"}
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
-        if isinstance(error, ValueError) and str(error).startswith(("JIRA 插件", "当前 JIRA", "本机缺少", "无法创建")):
-            raise
-        raise ValueError("JIRA 插件授权无法读取或校验，请在 CLI 中重新授权") from None
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        decoded = _read_flat(tmp)
+        if any(decoded.get(k) != str(v) for k, v in updates.items()):
+            die("配置内容无法无损保存，原文件没有改变。")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
-def load_creds(path):
-    if not os.path.exists(path):
-        die(f"凭据文件不存在: {path}\n请先运行初始化向导: {PROG} init"
-            f"（账号 → 验证 → 登记项目 → 设活动项目）；多实例可用 --profile（见 docs/01）。")
-    creds = _read_flat(path)
-    base = (creds.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
-    auth = {"user": creds.get("username", ""), "pw": creds.get("password", ""),
-            "token": creds.get("token", ""), "auth_source": "config"}
-    if not any((auth["user"], auth["pw"], auth["token"])):
-        try:
-            plugin = _plugin_credentials(base)
-        except ValueError as error:
-            die(str(error))
-        if plugin:
-            auth = plugin
-        elif creds.get("auth_source") == "quectel-cli":
-            die("未找到 JIRA 插件授权，请先在 CLI 中完成 JIRA 授权")
-    if not (auth["token"] or (auth["user"] and auth["pw"])):
-        die(f"凭据文件 {path} 缺字段: username+password（或 token）；可运行 {PROG} init 补齐。")
+def _config_from_creds(creds, path):
+    if not (creds.get("token") or (creds.get("username") and creds.get("password"))):
+        die(f"尚未配置可用的 JIRA 账号。请用本机登录弹窗完成初始化（python {PROG} init --dialog）。")
     timeout = 60
     if creds.get("timeout"):
         try:
             timeout = int(float(creds["timeout"]))
         except ValueError:
-            print(f"[警告] timeout 值无法解析: {creds['timeout']}，改用默认 60", file=sys.stderr)
+            print("[警告] 请求超时设置无效，使用默认 60 秒。", file=sys.stderr)
     projects = [s.strip() for s in (creds.get("projects") or "").split(",") if s.strip()]
     return {
-        "base": base,
-        **auth,
+        "base": (creds.get("base_url") or DEFAULT_BASE_URL).rstrip("/"),
+        "user": creds.get("username", ""),
+        "pw": creds.get("password", ""),
+        "token": creds.get("token", ""),
         "insecure": str(creds.get("insecure", "")).strip().lower() in ("1", "true", "yes", "on"),
         "timeout": timeout,
         "projects": projects,
@@ -374,6 +228,12 @@ def load_creds(path):
         "default_jql": (creds.get("default_jql") or "").strip(),
         "path": path,
     }
+
+
+def load_creds(path):
+    if not os.path.exists(path):
+        die(f"JIRA 本机配置不存在，请先用登录弹窗初始化（python {PROG} init --dialog）。")
+    return _config_from_creds(_read_flat(path), path)
 
 
 # ---------------- HTTP ----------------
@@ -473,7 +333,7 @@ def _request(method, path, params=None, body=None, raw=False, raw_body=None, hea
         req.remove_header("Authorization")
 
     ctx_ok, ctx_no = _contexts()
-    ctxs = [ctx_no] if C.get("insecure") else [ctx_ok, ctx_no]
+    ctxs = [ctx_no] if C.get("insecure") else ([ctx_ok] if C.get("strict_tls") else [ctx_ok, ctx_no])
     total = 3  # 1 次 + 最多 2 次重试（仅限 429/5xx/网络类）
     last_msg = None
     for attempt in range(total):
@@ -1060,33 +920,69 @@ def _prompt(label):
         print("（不能为空，请重试；Ctrl+C 可中止）")
 
 
+def _credentials_dialog(user="", base=DEFAULT_BASE_URL):
+    """Collect both credentials in one local modal; passwords never enter stdout."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk, simpledialog, messagebox
+    except ImportError:
+        die("本机登录窗口不可用，请在自己的终端运行 init，密码输入不会回显。")
+
+    class LoginDialog(simpledialog.Dialog):
+        def body(self, parent):
+            ttk.Label(parent, text="JIRA 地址：" + base).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+            ttk.Label(parent, text="用户名：").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+            self.username = ttk.Entry(parent, width=38)
+            self.username.insert(0, user)
+            self.username.grid(row=1, column=1, sticky="ew", pady=4)
+            ttk.Label(parent, text="密码：").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+            self.password = ttk.Entry(parent, width=38, show="*")
+            self.password.grid(row=2, column=1, sticky="ew", pady=4)
+            ttk.Label(parent, text="验证成功后仅保存到本机；取消不会改变原配置。").grid(
+                row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            return self.password if user else self.username
+
+        def validate(self):
+            if not self.username.get().strip() or not self.password.get():
+                messagebox.showerror("JIRA 登录", "请填写用户名和密码。", parent=self)
+                return False
+            return True
+
+        def apply(self):
+            self.result = (self.username.get().strip(), self.password.get())
+            self.password.delete(0, tk.END)
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        return LoginDialog(root, title="JIRA 登录").result
+    except (RuntimeError, tk.TclError):
+        die("本机登录窗口不可用，请在自己的终端运行 init，密码输入不会回显。")
+    finally:
+        if root is not None:
+            root.destroy()
+
+
 def _init_check(path):
     global C
     print(f"[检查] 配置文件: {path}")
     if not os.path.exists(path):
-        print("  状态: 未初始化 ✗")
-        print(f"  下一步: python {PROG} init   （交互向导：账号 → 验证 → 登记项目 → 设活动项目）")
+        print(f"  状态: 未初始化；请用本机登录弹窗配置账号（python {PROG} init --dialog）。")
         sys.exit(1)
     creds = _read_flat(path)
-    try:
-        C = load_creds(path)
-    except SystemExit:
-        print("  状态: 未初始化(不完整) ✗ → 请补齐 JIRA 授权或账号配置")
-        raise
+    C = load_creds(path)
     print(f"  实例: {C['base']}")
     print(f"  账号: {C.get('user') or '(token 认证)'}")
-    if C.get("auth_source") == "quectel-cli":
-        print("  授权: 复用本机 JIRA 插件")
-    try:
-        _, me = _request("GET", "/rest/api/2/myself")
-        print(f"  认证: OK（{me.get('displayName')}）")
-    except SystemExit:
-        print("  认证: 失败 ✗（检查账号密码/SSO；或重跑 init）")
-        sys.exit(1)
+    _, me = _request("GET", "/rest/api/2/myself")
+    if not isinstance(me, dict) or not me.get("name"):
+        die("JIRA 未返回有效身份，请重新核对账号。")
+    print(f"  认证: OK（{me.get('displayName') or me['name']}）")
     projects = [s.strip() for s in (creds.get("projects") or "").split(",") if s.strip()]
     active = (creds.get("active_project") or "").strip()
-    print(f"  已登记项目({len(projects)}): {', '.join(projects) if projects else '（无）→ 运行 init 登记'}")
-    print(f"  当前活动项目: {active if active else '（未设置）→ ' + PROG + ' use <项目>'}")
+    print(f"  已登记项目({len(projects)}): {', '.join(projects) if projects else '（无）→ use <项目>'}")
+    print(f"  当前活动项目: {active or '（未设置）→ use <项目>'}")
     pd = _project_cfg_dir()
     pf = sorted(f for f in os.listdir(pd) if f.lower().endswith((".yaml", ".yml"))) if os.path.isdir(pd) else []
     if pf:
@@ -1174,58 +1070,88 @@ def cmd_init(args):
         _init_check(path)
         return
     interactive = sys.stdin.isatty()
-    creds = _read_flat(path) if os.path.exists(path) else {}
-    base = (args.base_url or creds.get("base_url") or DEFAULT_BASE_URL).strip()
+    before = None
+    if os.path.exists(path):
+        with open(path, "rb") as file:
+            before = hashlib.sha256(file.read()).digest()
+    creds = _read_flat(path) if before is not None else {}
+    base = (args.base_url or creds.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
     user = (args.username or creds.get("username") or "").strip()
     pw = args.password or creds.get("password") or ""
     token = (args.token or creds.get("token") or "").strip()
+    dialog = getattr(args, "dialog", False)
     print(f"[初始化] 配置文件: {path}")
-    if creds:
-        print(f"[初始化] 检测到现有配置（{creds.get('base_url', '?')}），将补齐/更新缺失项")
-    if not base:
-        if not interactive:
-            die("非交互模式须提供 --base-url（或已有 base_url）；交互模式直接运行 init 按提示输入")
-        base = _prompt("JIRA 地址（如 https://ticket.你的公司.com）")
-    plugin = None
-    if not any((user, pw, token)):
-        try:
-            plugin = _plugin_credentials(base)
-        except ValueError as error:
-            die(str(error))
-        if plugin:
-            print("[初始化] 复用本机 JIRA 插件授权，无需再次输入账号密码")
-        elif creds.get("auth_source") == "quectel-cli":
-            die("未找到 JIRA 插件授权，请先在 CLI 中完成 JIRA 授权")
-    if not token and not plugin:
-        if not user:
-            if not interactive:
-                die("非交互模式须提供 --username（或已有）")
-            user = _prompt("登录名")
-        if not pw:
-            if not interactive:
-                die("非交互模式须提供 --password（或 --token）")
-            pw = getpass.getpass("密码（输入不回显）: ").strip()
-            if not pw:
-                die("密码为空，已中止")
-    updates = {"base_url": base.rstrip("/")}
+    if dialog or (not interactive and not (token or (user and pw))):
+        if dialog and args.token:
+            die("登录弹窗使用用户名密码，请不要同时指定 token。")
+        result = _credentials_dialog(user, base)
+        if result is None:
+            die("已取消登录，原配置没有改变。")
+        user, pw = result
+        token = ""
+    elif not token:
+        user = user or _prompt("JIRA 用户名")
+        pw = pw or getpass.getpass("JIRA 密码（输入不回显）: ")
+    updates = {"base_url": base}
     if user:
         updates["username"] = user
     if pw:
         updates["password"] = pw
     if token:
         updates["token"] = token
-    if plugin:
-        updates["auth_source"] = "quectel-cli"
-    _update_cfg(path, updates)
-    C = load_creds(path)
-    if getattr(args, "timeout", None):
-        C["timeout"] = args.timeout
-    if getattr(args, "insecure", False):
-        C["insecure"] = True
-    print(f"[保存] 配置已写入: {path}")
-    _, me = _request("GET", "/rest/api/2/myself")
-    print(f"[验证] 身份: {me.get('displayName')} (name={me.get('name')}) @ {C['base']}")
-    _init_projects(args, path)
+    elif dialog:
+        updates["token"] = ""
+    candidate = dict(creds, **updates)
+    previous = C
+    saved = False
+    try:
+        C = _config_from_creds(candidate, path)
+        C["strict_tls"] = True
+        if getattr(args, "timeout", None):
+            C["timeout"] = args.timeout
+        if getattr(args, "insecure", False):
+            C["insecure"] = True
+        errors = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(errors), contextlib.redirect_stderr(errors):
+                status, me = _request("GET", "/rest/api/2/myself")
+        except (SystemExit, OSError, ValueError):
+            text = errors.getvalue()
+            if re.search(r"HTTP (401|403)\b", text):
+                reason = "账号密码无效或没有权限"
+            elif "证书" in text:
+                reason = "公司证书未受信任，请配置公司 CA"
+            else:
+                reason = "请检查账号、网络和公司证书"
+            die(f"JIRA 登录验证失败：{reason}；原配置没有改变。")
+        finally:
+            errors.close()
+        if status != 200 or not isinstance(me, dict) or not me.get("name"):
+            die("JIRA 未返回有效身份，原配置没有改变。")
+        if not token and user.casefold() not in {str(me.get("name", "")).casefold(),
+                                               str(me.get("emailAddress", "")).casefold()}:
+            die("JIRA 返回的账号与输入不一致，原配置没有改变。")
+        with _file_lock(path + ".lock"):
+            current = None
+            if os.path.exists(path):
+                with open(path, "rb") as file:
+                    current = hashlib.sha256(file.read()).digest()
+            if current != before:
+                die("本机配置已被其他任务更新，已停止保存；请重新登录。")
+            _update_cfg(path, updates)
+        C = load_creds(path)
+        if getattr(args, "timeout", None):
+            C["timeout"] = args.timeout
+        if getattr(args, "insecure", False):
+            C["insecure"] = True
+        saved = True
+    finally:
+        if not saved:
+            C = previous
+    print(f"[验证] 身份: {me.get('displayName') or me['name']} (name={me['name']}) @ {C['base']}")
+    print(f"[保存] 已验证的账号配置已写入: {path}")
+    if not dialog or args.projects is not None or args.use:
+        _init_projects(args, path)
     cfg = _read_flat(path)
     projects = [s.strip() for s in (cfg.get("projects") or "").split(",") if s.strip()]
     active = (cfg.get("active_project") or "").strip()
@@ -2471,11 +2397,18 @@ def main():
     ini.add_argument("--check", action="store_true", help="只检查当前配置状态（返回码 0=已就绪），不做任何修改")
     ini.add_argument("--base-url", help=f"JIRA 地址（优先使用已有配置，未配置默认 {DEFAULT_BASE_URL}）")
     ini.add_argument("--username", help="登录名")
+    ini.add_argument("--dialog", action="store_true", help="本机用户名密码弹窗；验证成功才保存，不回显密码")
     ini.add_argument("--password", help="密码（交互模式下建议不传此参数，改用提示输入且不回显）")
     ini.add_argument("--token", help="Bearer token（Server PAT；与密码二选一）")
     ini.add_argument("--projects", help="登记的项目 KEY，逗号分隔（或 all=全部）")
     ini.add_argument("--use", help="顺便把活动项目设为该 KEY")
     ini.set_defaults(fn=cmd_init)
+
+    au = sub.add_parser("authorize", help="兼容登录入口：本机账号密码直连 JIRA，不改工单")
+    au.add_argument("--base-url", help=f"JIRA 地址（默认 {DEFAULT_BASE_URL}）")
+    au.add_argument("--username", help="账号（可省略，在本机输入）")
+    au.add_argument("--dialog", action="store_true", default=True, help="用本机遮掩输入窗口")
+    au.set_defaults(fn=cmd_init, check=False, password=None, token=None, projects=None, use=None)
 
     us = sub.add_parser("use", help="查看/切换当前活动项目（不带参数=查看列表）")
     us.add_argument("target", nargs="?", help="项目 KEY（或列表里的序号；支持前缀模糊匹配）")
@@ -2619,8 +2552,8 @@ def main():
     at.set_defaults(fn=cmd_attachments)
 
     args = p.parse_args()
-    if args.cmd == "init":
-        # init 自行处理配置的加载/创建（首次运行时文件还不存在）
+    if args.cmd in ("init", "authorize"):
+        # 初始化与授权自行处理配置，首次运行时文件可能还不存在。
         args.fn(args)
         return
     nb = _nearby_cfg()
@@ -2628,6 +2561,8 @@ def main():
         args.profile = nb["profile"]
         print(f"[提示] 使用项目文件夹配置的 profile: {nb['profile']}（{nb['_path']}）", file=sys.stderr)
     path = resolve_creds_path(args)
+    explicit = (args.config or args.profile or os.environ.get("JIRA_CREDS_PATH")
+                or os.environ.get("JIRA_PROFILE"))
     C = load_creds(path)
     if args.timeout:
         C["timeout"] = args.timeout
